@@ -1,6 +1,8 @@
 /**
  * Mesh Node Implementation
  * Core mesh network functionality for ESP32
+ * PlatformIO compatible for VS Code
+ * Supports: ESP32-C3 (2.4 GHz), ESP32-C5 (5 GHz), Generic ESP32
  */
 
 #include "mesh_node.h"
@@ -27,10 +29,54 @@ int8_t current_tx_power = 8; // Default: 0 dBm (8 = 0dBm in ESP32)
 uint8_t node_mac[6] = {0};
 int udp_socket = -1;
 bool mesh_initialized = false;
+bool wifi_initialized = false;
 
 // Timer handles
 esp_timer_handle_t state_update_timer = NULL;
 esp_timer_handle_t neighbor_cleanup_timer = NULL;
+
+// ============================================================================
+// Platform-Specific Initialization
+// ============================================================================
+
+/**
+ * Platform-specific initialization
+ */
+void platform_init(void) {
+    ESP_LOGI(TAG, "Initializing platform: %s", PLATFORM_NAME);
+    
+    // Platform-specific WiFi configuration
+    #if ESP_PLATFORM == ESP32_C3
+        ESP_LOGI(TAG, "Configuring for ESP32-C3 (2.4 GHz only)");
+    #elif ESP_PLATFORM == ESP32_C5
+        ESP_LOGI(TAG, "Configuring for ESP32-C5 (2.4 GHz + 5 GHz)");
+    #elif ESP_PLATFORM == ESP32 || ESP_PLATFORM == ESP32_GENERIC
+        ESP_LOGI(TAG, "Configuring for Generic ESP32 (2.4 GHz)");
+    #else
+        ESP_LOGI(TAG, "Configuring for unknown platform");
+    #endif
+    
+    // Validate channel selection
+    #if defined(WIFI_CHANNEL)
+        #if ESP_PLATFORM == ESP32_C3 || ESP_PLATFORM == ESP32 || ESP_PLATFORM == ESP32_GENERIC
+            // 2.4 GHz platforms: channels 1-14
+            if (WIFI_CHANNEL < 1 || WIFI_CHANNEL > 14) {
+                ESP_LOGW(TAG, "Invalid 2.4 GHz channel %d, using channel 6", WIFI_CHANNEL);
+                #undef WIFI_CHANNEL
+                #define WIFI_CHANNEL 6
+            }
+        #elif ESP_PLATFORM == ESP32_C5
+            // 5 GHz platform: channels 36-165
+            if (WIFI_CHANNEL < 36 || WIFI_CHANNEL > 165) {
+                ESP_LOGW(TAG, "Invalid 5 GHz channel %d, using channel 36", WIFI_CHANNEL);
+                #undef WIFI_CHANNEL
+                #define WIFI_CHANNEL 36
+            }
+        #endif
+    #endif
+    
+    ESP_LOGI(TAG, "Using WiFi channel: %d", WIFI_CHANNEL);
+}
 
 // ============================================================================
 // Initialization Functions
@@ -66,6 +112,7 @@ void init_wifi(void) {
     // Get MAC address
     ESP_ERROR_CHECK(esp_wifi_get_mac(WIFI_IF_STA, node_mac));
     
+    wifi_initialized = true;
     ESP_LOGI(TAG, "WiFi initialized, MAC: ");
     print_mac(node_mac);
 }
@@ -81,7 +128,11 @@ void init_mesh(void) {
         .channel = WIFI_CHANNEL,
         .router.ssid = MESH_ROUTER_SSID,
         .router.password = MESH_ROUTER_PASS,
+        #if defined(MESH_ROUTER_BSSID)
         .router.bssid = MESH_ROUTER_BSSID,
+        #else
+        .router.bssid = {0},
+        #endif
         .mesh_id = "glow_mesh",
         .mesh_ap.max_connection = 6,
         .mesh_ap.nonmesh_ap_table_size = 1,
@@ -95,7 +146,6 @@ void init_mesh(void) {
         .mesh_ap.listen_interval = 3,
         .mesh_ap.nonmesh_ap_probe_interval = 30000, // ms
         .mesh_ap.mesh_ap_idle_interval = 10000, // ms
-        .mesh_ap.mesh_ap_scan_interval = 30000, // ms
         .mesh_ap.mesh_ap_max_age = 60000, // ms
         .mesh_ap.mesh_ap_fail_interval = 3000, // ms
         .mesh_ap.mesh_ap_select_interval = 1000, // ms
@@ -170,9 +220,6 @@ void init_udp(void) {
         udp_socket = -1;
         return;
     }
-    
-    // Set up receive callback (non-blocking)
-    // For simplicity, we'll use a separate task for receiving
     
     ESP_LOGI(TAG, "UDP socket initialized on port %d", UDP_PORT);
 }
@@ -423,7 +470,12 @@ void forward_to_visualization(mesh_message_t *msg) {
     
     // Parse visualization IP
     uint32_t ip_addr = 0;
-    char *token = strtok((char *)VISUALIZATION_IP, ".");
+    const char *ip_str = VISUALIZATION_IP;
+    char ip_copy[16];
+    strncpy(ip_copy, ip_str, sizeof(ip_copy) - 1);
+    ip_copy[sizeof(ip_copy) - 1] = '\0';
+    
+    char *token = strtok(ip_copy, ".");
     for (int i = 0; i < 4 && token != NULL; i++) {
         ip_addr = (ip_addr << 8) | atoi(token);
         token = strtok(NULL, ".");
@@ -515,9 +567,9 @@ void adjust_tx_power(void) {
     
     // Adjust TX power towards required power
     if (required_power > current_tx_power) {
-        current_tx_power = min(current_tx_power + TX_POWER_STEP, MAX_TX_POWER);
+        current_tx_power = MIN(current_tx_power + TX_POWER_STEP, MAX_TX_POWER);
     } else if (required_power < current_tx_power) {
-        current_tx_power = max(current_tx_power - TX_POWER_STEP, MIN_TX_POWER);
+        current_tx_power = MAX(current_tx_power - TX_POWER_STEP, MIN_TX_POWER);
     }
     
     // Set new TX power
@@ -555,7 +607,7 @@ int8_t calculate_required_tx_power(void) {
     int8_t required_power = current_tx_power + adjustment;
     
     // Clamp to valid range
-    return max(MIN_TX_POWER, min(MAX_TX_POWER, required_power));
+    return CLAMP(required_power, MIN_TX_POWER, MAX_TX_POWER);
 }
 
 // ============================================================================
@@ -791,18 +843,6 @@ void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id
             case WIFI_EVENT_STA_AUTHMODE_CHANGE:
                 ESP_LOGI(TAG, "STA auth mode change");
                 break;
-            case WIFI_EVENT_STA_WPS_ER_SUCCESS:
-                ESP_LOGI(TAG, "STA WPS success");
-                break;
-            case WIFI_EVENT_STA_WPS_ER_FAILED:
-                ESP_LOGI(TAG, "STA WPS failed");
-                break;
-            case WIFI_EVENT_STA_WPS_ER_TIMEOUT:
-                ESP_LOGI(TAG, "STA WPS timeout");
-                break;
-            case WIFI_EVENT_STA_WPS_ER_PIN:
-                ESP_LOGI(TAG, "STA WPS PIN");
-                break;
             case WIFI_EVENT_AP_START:
                 ESP_LOGI(TAG, "AP start");
                 break;
@@ -814,12 +854,6 @@ void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id
                 break;
             case WIFI_EVENT_AP_STADISCONNECTED:
                 ESP_LOGI(TAG, "AP STA disconnected");
-                break;
-            case WIFI_EVENT_AP_PROBEREQRECVED:
-                ESP_LOGI(TAG, "AP probe request received");
-                break;
-            case WIFI_EVENT_FTM_REPORT:
-                ESP_LOGI(TAG, "FTM report");
                 break;
             default:
                 ESP_LOGD(TAG, "Unhandled WiFi event: %d", event_id);
@@ -845,46 +879,6 @@ void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id
         event.id = event_id;
         event.data = event_data;
         mesh_event_handler(event);
-    }
-}
-
-/**
- * UDP receive callback (placeholder - in practice, use a separate task)
- */
-void udp_receive_callback(void *arg, int sockfd, struct sockaddr_in *from, uint8_t *data, uint16_t len) {
-    if (len < sizeof(mesh_message_t)) {
-        ESP_LOGW(TAG, "Received short UDP packet: %d bytes", len);
-        return;
-    }
-    
-    mesh_message_t *msg = (mesh_message_t *)data;
-    
-    // Verify checksum
-    if (!verify_checksum(msg)) {
-        ESP_LOGW(TAG, "Invalid checksum from: ");
-        print_mac(msg->mac);
-        return;
-    }
-    
-    // Check if this is from a neighbor
-    bool is_neighbor = false;
-    for (int i = 0; i < MAX_NEIGHBORS; i++) {
-        if (neighbor_list[i].active && memcmp(neighbor_list[i].mac, msg->mac, 6) == 0) {
-            is_neighbor = true;
-            break;
-        }
-    }
-    
-    if (!is_neighbor) {
-        // Forward non-neighbor messages to visualization
-        forward_to_visualization(msg);
-    }
-    
-    // Process the message (update neighbor state, etc.)
-    if (DEBUG_UDP) {
-        ESP_LOGD(TAG, "Received UDP from: ");
-        print_mac(msg->mac);
-        ESP_LOGD(TAG, " Type: %d, State: %d", msg->msg_type, msg->state.state);
     }
 }
 

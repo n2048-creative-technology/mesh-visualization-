@@ -1,6 +1,7 @@
 /**
  * Mesh Node Header
  * Core mesh network functionality for ESP32
+ * PlatformIO compatible for VS Code
  */
 
 #pragma once
@@ -32,7 +33,7 @@ typedef struct {
  * Node state structure
  */
 typedef struct {
-    uint8_t state;           // Node state (0=idle, 1=active, 2=error)
+    uint8_t state;           // Node state (0=idle, 1=active, 2=error, 3=booting)
     uint8_t color[3];        // RGB color
     int16_t temperature;     // Temperature ×10
     uint8_t mmwave_presence; // 0 or 1
@@ -94,10 +95,12 @@ void mac_to_ip(uint8_t *mac, uint8_t *ip);
 void print_mac(uint8_t *mac);
 void print_ip(uint8_t *ip);
 
+// Platform-specific initialization
+void platform_init(void);
+
 // Callbacks
 esp_err_t mesh_event_handler(mesh_event_t event);
 void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data);
-void udp_receive_callback(void *arg, int sockfd, struct sockaddr_in *from, uint8_t *data, uint16_t len);
 
 // ============================================================================
 // Global Variables (extern)
@@ -110,3 +113,4 @@ extern int8_t current_tx_power;
 extern uint8_t node_mac[6];
 extern int udp_socket;
 extern bool mesh_initialized;
+extern bool wifi_initialized;

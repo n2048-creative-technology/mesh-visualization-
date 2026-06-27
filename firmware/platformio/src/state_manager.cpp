@@ -1,6 +1,7 @@
 /**
  * State Manager Implementation
  * Manages node state, sensors, and LED control
+ * PlatformIO compatible for VS Code
  */
 
 #include "state_manager.h"
@@ -16,14 +17,14 @@ uint8_t led_pwm_channels[3] = {0};
 bool sensors_initialized = false;
 
 // LED PWM configuration
-#define LEDC_TIMER          LEDC_TIMER_0
-#define LEDC_MODE           LEDC_LOW_SPEED_MODE
-#define LEDC_OUTPUT_IO      (1 << LED_RED_PIN) | (1 << LED_GREEN_PIN) | (1 << LED_BLUE_PIN)
-#define LEDC_CHANNEL_RED    LEDC_CHANNEL_0
-#define LEDC_CHANNEL_GREEN  LEDC_CHANNEL_1
-#define LEDC_CHANNEL_BLUE   LEDC_CHANNEL_2
+#define LEDC_TIMER LEDC_TIMER_0
+#define LEDC_MODE LEDC_LOW_SPEED_MODE
+#define LEDC_OUTPUT_IO (1ULL << LED_RED_PIN) | (1ULL << LED_GREEN_PIN) | (1ULL << LED_BLUE_PIN)
+#define LEDC_CHANNEL_RED LEDC_CHANNEL_0
+#define LEDC_CHANNEL_GREEN LEDC_CHANNEL_1
+#define LEDC_CHANNEL_BLUE LEDC_CHANNEL_2
 #define LEDC_DUTY_RESOLUTION LEDC_TIMER_8_BIT
-#define LEDC_FREQUENCY      5000
+#define LEDC_FREQUENCY 5000
 
 // ADC configuration for temperature sensor
 adc_oneshot_unit_handle_t adc_handle = NULL;
@@ -123,7 +124,7 @@ void init_sensors(void) {
         .atten = ADC_ATTEN_DB_11,
     };
     
-    err = adc_oneshot_config_channel(adc_handle, TEMP_SENSOR_PIN, &config);
+    err = adc_oneshot_config_channel(adc_handle, TEMPERATURE_PIN, &config);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "ADC channel configuration failed: %s", esp_err_to_name(err));
         return;
@@ -256,7 +257,7 @@ void read_temperature(void) {
     }
     
     int raw_value = 0;
-    esp_err_t err = adc_oneshot_read(adc_handle, TEMP_SENSOR_PIN, &raw_value);
+    esp_err_t err = adc_oneshot_read(adc_handle, TEMPERATURE_PIN, &raw_value);
     
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Failed to read temperature: %s", esp_err_to_name(err));

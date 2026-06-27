@@ -1,6 +1,7 @@
 /**
  * Beacon Monitor Implementation
  * Handles promiscuous mode scanning and RSSI tracking for neighbor discovery
+ * PlatformIO compatible for VS Code
  */
 
 #include "beacon_monitor.h"

@@ -1,38 +1,22 @@
 /**
  * State Manager Header
  * Manages node state, sensors, and LED control
+ * PlatformIO compatible for VS Code
  */
 
 #pragma once
 
 #include "config.h"
 #include "mesh_node.h"
-#include <driver/gpio.h>
-#include <driver/adc.h>
-
-// ============================================================================
-// LED Configuration
-// ============================================================================
-
-#define LED_RED_PIN       GPIO_NUM_1
-#define LED_GREEN_PIN     GPIO_NUM_2
-#define LED_BLUE_PIN      GPIO_NUM_3
-
-// ============================================================================
-// Sensor Configuration
-// ============================================================================
-
-#define TEMP_SENSOR_PIN   GPIO_NUM_4
-#define MMWAVE_SENSOR_PIN GPIO_NUM_5
 
 // ============================================================================
 // State Definitions
 // ============================================================================
 
-#define NODE_STATE_IDLE       0
-#define NODE_STATE_ACTIVE     1
-#define NODE_STATE_ERROR      2
-#define NODE_STATE_BOOTING    3
+#define NODE_STATE_IDLE 0
+#define NODE_STATE_ACTIVE 1
+#define NODE_STATE_ERROR 2
+#define NODE_STATE_BOOTING 3
 
 // ============================================================================
 // Function Declarations

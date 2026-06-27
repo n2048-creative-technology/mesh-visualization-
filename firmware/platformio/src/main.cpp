@@ -1,6 +1,8 @@
 /**
  * Main Entry Point for ESP32 Mesh Node
  * Adaptive mesh topology with UDP unicast and dynamic TX power
+ * PlatformIO compatible for VS Code
+ * Supports: ESP32-C3 (2.4 GHz), ESP32-C5 (5 GHz), Generic ESP32
  */
 
 #include "mesh_node.h"
@@ -84,10 +86,17 @@ void udp_receive_task(void *pvParameters) {
 extern "C" void app_main(void) {
     ESP_LOGI(TAG, "========================================");
     ESP_LOGI(TAG, "  ESP32 Mesh Node - Adaptive Topology");
+    ESP_LOGI(TAG, "  Platform: %s", PLATFORM_NAME);
+    ESP_LOGI(TAG, "  WiFi Channel: %d", WIFI_CHANNEL);
+    ESP_LOGI(TAG, "  Supports 2.4GHz: %s", SUPPORTS_24GHZ ? "Yes" : "No");
+    ESP_LOGI(TAG, "  Supports 5GHz: %s", SUPPORTS_5GHZ ? "Yes" : "No");
     ESP_LOGI(TAG, "========================================");
     
+    // Initialize platform-specific hardware
+    platform_init();
+    
     // Initialize mesh node
-    mesh_node_init();
+    init_mesh();
     
     // Set node to active state
     set_node_state(NODE_STATE_ACTIVE);

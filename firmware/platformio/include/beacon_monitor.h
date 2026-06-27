@@ -1,6 +1,7 @@
 /**
  * Beacon Monitor Header
  * Handles promiscuous mode scanning and RSSI tracking
+ * PlatformIO compatible for VS Code
  */
 
 #pragma once
