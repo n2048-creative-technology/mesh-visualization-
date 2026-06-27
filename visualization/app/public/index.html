@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Adaptive Mesh Topology Visualization</title>
+    <link rel="stylesheet" href="style.css">
+    <script src="https://d3js.org/d3.v7.min.js"></script>
+</head>
+<body>
+    <div class="header">
+        <h1>Adaptive Mesh Topology Visualization</h1>
+        <div class="stats">
+            <span id="node-count">0 Nodes</span> |
+            <span id="connection-count">0 Connections</span> |
+            <span id="last-update">Never</span>
+        </div>
+    </div>
+    
+    <div class="controls">
+        <div class="control-group">
+            <label for="color-scheme">Color Scheme:</label>
+            <select id="color-scheme">
+                <option value="rssi">By RSSI Strength</option>
+                <option value="state">By Node State</option>
+                <option value="temperature">By Temperature</option>
+                <option value="fixed">Fixed Color</option>
+            </select>
+        </div>
+        
+        <div class="control-group">
+            <label for="show-labels">Show Labels:</label>
+            <input type="checkbox" id="show-labels" checked>
+        </div>
+        
+        <div class="control-group">
+            <label for="show-rssi">Show RSSI:</label>
+            <input type="checkbox" id="show-rssi" checked>
+        </div>
+        
+        <div class="control-group">
+            <label for="min-rssi">Min RSSI:</label>
+            <input type="range" id="min-rssi" min="-100" max="0" value="-80">
+            <span id="min-rssi-value">-80</span> dBm
+        </div>
+        
+        <div class="control-group">
+            <button id="reset-view">Reset View</button>
+            <button id="pause-simulation">Pause</button>
+        </div>
+    </div>
+    
+    <div class="visualization-container">
+        <svg id="visualization"></svg>
+    </div>
+    
+    <div class="node-info-panel" id="node-info-panel">
+        <div class="node-info-header">
+            <span class="close-btn" id="close-node-info">&times;</span>
+            <h3>Node Information</h3>
+        </div>
+        <div class="node-info-content" id="node-info-content">
+            <!-- Node details will be inserted here -->
+        </div>
+    </div>
+    
+    <div class="legend">
+        <h4>Legend</h4>
+        <div class="legend-item">
+            <div class="legend-color" style="background-color: #00ff00;"></div>
+            <span>Active Node</span>
+        </div>
+        <div class="legend-item">
+            <div class="legend-color" style="background-color: #0000ff;"></div>
+            <span>Idle Node</span>
+        </div>
+        <div class="legend-item">
+            <div class="legend-color" style="background-color: #ff0000;"></div>
+            <span>Error Node</span>
+        </div>
+        <div class="legend-item">
+            <div class="legend-color" style="background-color: #ffff00;"></div>
+            <span>Booting Node</span>
+        </div>
+        <div class="legend-item">
+            <div class="legend-line strong"></div>
+            <span>Strong Connection (-50 dBm)</span>
+        </div>
+        <div class="legend-item">
+            <div class="legend-line weak"></div>
+            <span>Weak Connection (-80 dBm)</span>
+        </div>
+    </div>
+    
+    <script src="script.js"></script>
+</body>
+</html>
