@@ -1,12 +1,12 @@
 /**
  * Beacon Monitor Implementation
- * Handles promiscuous mode scanning and RSSI tracking for neighbor discovery
+ * Handles WiFi scanning and RSSI tracking for neighbor discovery
  * PlatformIO compatible for VS Code
  */
 
 #include "beacon_monitor.h"
 #include "mesh_node.h"
-#include <esp_log.h>
+#include "esp32_arduino_compat.h"
 #include <string.h>
 
 static const char *TAG = "BEACON_MONITOR";
@@ -25,19 +25,46 @@ uint32_t last_beacon_scan_time = 0;
 void init_beacon_monitoring(void) {
     ESP_LOGI(TAG, "Initializing beacon monitoring");
     
-    // Start promiscuous mode
+    #if defined(ARDUINO)
+    // Arduino framework - use WiFi scan
+    start_beacon_scanning();
+    
+    #else
+    // ESP-IDF framework - use promiscuous mode
     start_promiscuous_mode();
     
+    #endif
+    
     beacon_monitoring_active = true;
-    last_beacon_scan_time = esp_timer_get_time() / 1000; // Convert to ms
+    last_beacon_scan_time = millis();
     
     ESP_LOGI(TAG, "Beacon monitoring initialized");
 }
 
 /**
- * Start promiscuous mode for beacon frame capture
+ * Start beacon scanning (Arduino) or promiscuous mode (ESP-IDF)
+ */
+void start_beacon_scanning(void) {
+    ESP_LOGI(TAG, "Starting beacon scanning");
+    
+    #if defined(ARDUINO)
+    // Arduino framework - start WiFi scan
+    // Note: This is a simplified approach
+    // In a real implementation, you'd want to scan periodically
+    WiFi.scanNetworks(true); // Async scan
+    
+    #else
+    // ESP-IDF framework - start promiscuous mode
+    start_promiscuous_mode();
+    
+    #endif
+}
+
+/**
+ * Start promiscuous mode for beacon frame capture (ESP-IDF only)
  */
 void start_promiscuous_mode(void) {
+    #if !defined(ARDUINO)
     ESP_LOGI(TAG, "Starting promiscuous mode");
     
     // Set promiscuous mode callback
@@ -52,12 +79,14 @@ void start_promiscuous_mode(void) {
     }
     
     ESP_LOGI(TAG, "Promiscuous mode enabled");
+    #endif
 }
 
 /**
- * Stop promiscuous mode
+ * Stop promiscuous mode (ESP-IDF only)
  */
 void stop_promiscuous_mode(void) {
+    #if !defined(ARDUINO)
     ESP_LOGI(TAG, "Stopping promiscuous mode");
     
     esp_err_t err = esp_wifi_set_promiscuous(false);
@@ -68,6 +97,7 @@ void stop_promiscuous_mode(void) {
     
     beacon_monitoring_active = false;
     ESP_LOGI(TAG, "Promiscuous mode disabled");
+    #endif
 }
 
 // ============================================================================
@@ -106,9 +136,53 @@ void process_beacon_frame(uint8_t *frame, uint16_t len, int8_t rssi) {
 }
 
 /**
+ * Process WiFi scan results (Arduino)
+ */
+void process_scan_results(void) {
+    #if defined(ARDUINO)
+    int n = WiFi.scanComplete();
+    
+    if (n == WIFI_SCAN_RUNNING) {
+        // Scan still running
+        return;
+    } else if (n == WIFI_SCAN_FAILED) {
+        ESP_LOGW(TAG, "WiFi scan failed");
+        return;
+    } else if (n > 0) {
+        // Process scan results
+        for (int i = 0; i < n; i++) {
+            beacon_info_t beacon;
+            
+            // Get scan result
+            String ssid; uint8_t mac[6]; int32_t rssi; uint8_t encryptionType; int32_t channel; WiFi.getNetworkInfo(i, ssid, rssi, mac, channel, encryptionType); memcpy(beacon.ssid, ssid.c_str(), ssid.length()); beacon.rssi = rssi; memcpy(beacon.mac, mac, 6); beacon.channel = channel; beacon.encryption_type = encryptionType;
+            beacon.ssid_len = strlen((const char*)beacon.ssid);
+            
+            // Process beacon
+            process_beacon_frame(NULL, 0, beacon.rssi);
+        }
+    }
+    
+    // Start new scan
+    WiFi.scanNetworks(true);
+    last_beacon_scan_time = millis();
+    
+    #endif
+}
+
+/**
  * Extract beacon frame information
  */
 bool extract_beacon_info(uint8_t *frame, uint16_t len, beacon_info_t *beacon) {
+    if (!beacon) return false;
+    
+    #if defined(ARDUINO)
+    // Arduino framework - simplified beacon info
+    // In practice, you'd extract this from WiFi scan results
+    memset(beacon, 0, sizeof(beacon_info_t));
+    return true;
+    
+    #else
+    // ESP-IDF framework - extract from raw frame
     if (len < 40) { // Minimum beacon frame size
         return false;
     }
@@ -173,6 +247,7 @@ bool extract_beacon_info(uint8_t *frame, uint16_t len, beacon_info_t *beacon) {
     }
     
     return true;
+    #endif
 }
 
 // ============================================================================
@@ -180,10 +255,11 @@ bool extract_beacon_info(uint8_t *frame, uint16_t len, beacon_info_t *beacon) {
 // ============================================================================
 
 /**
- * WiFi promiscuous mode callback
+ * WiFi promiscuous mode callback (ESP-IDF only)
  * Called for every received frame
  */
 void wifi_promiscuous_callback(void *buf, wifi_promiscuous_pkt_type_t type) {
+    #if !defined(ARDUINO)
     wifi_promiscuous_pkt_t *pkt = (wifi_promiscuous_pkt_t *)buf;
     
     // Only process management frames (beacons)
@@ -196,7 +272,8 @@ void wifi_promiscuous_callback(void *buf, wifi_promiscuous_pkt_type_t type) {
     process_beacon_frame(pkt->payload, pkt->rx_ctrl.sig_len, rssi);
     
     // Update last scan time
-    last_beacon_scan_time = esp_timer_get_time() / 1000;
+    last_beacon_scan_time = millis();
+    #endif
 }
 
 // ============================================================================
@@ -234,4 +311,33 @@ void print_beacon_info(beacon_info_t *beacon) {
     print_mac(beacon->mac);
     ESP_LOGD(TAG, ", RSSI=%d, Channel=%d, SSID=%s", 
              beacon->rssi, beacon->channel, beacon->ssid);
+}
+
+// ============================================================================
+// Periodic Functions
+// ============================================================================
+
+/**
+ * Update beacon monitoring
+ * Call this periodically to process scan results
+ */
+void update_beacon_monitoring(void) {
+    if (!beacon_monitoring_active) return;
+    
+    #if defined(ARDUINO)
+    // Process scan results
+    process_scan_results();
+    
+    // Check if it's time to start a new scan
+    uint32_t current_time = millis();
+    if (current_time - last_beacon_scan_time > BEACON_SCAN_INTERVAL) {
+        start_beacon_scanning();
+    }
+    
+    #else
+    // ESP-IDF framework - promiscuous mode runs continuously
+    // Just update the last scan time
+    last_beacon_scan_time = millis();
+    
+    #endif
 }

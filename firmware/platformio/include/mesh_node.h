@@ -7,11 +7,20 @@
 #pragma once
 
 #include "config.h"
+#include "esp32_arduino_compat.h"
+
+// Include ESP-IDF headers if using ESP-IDF framework
+#if defined(ARDUINO)
+// Arduino framework - use compatibility layer
+#else
+// ESP-IDF framework
 #include <esp_wifi.h>
 #include <esp_mesh.h>
 #include <esp_netif.h>
 #include <lwip/sockets.h>
 #include <lwip/netdb.h>
+#endif
+
 #include <string.h>
 
 // ============================================================================
@@ -28,18 +37,6 @@ typedef struct {
     uint8_t ip[4];       // Resolved IP address
     bool active;         // Currently active
 } neighbor_info_t;
-
-/**
- * Node state structure
- */
-typedef struct {
-    uint8_t state;           // Node state (0=idle, 1=active, 2=error, 3=booting)
-    uint8_t color[3];        // RGB color
-    int16_t temperature;     // Temperature ×10
-    uint8_t mmwave_presence; // 0 or 1
-    uint32_t mmwave_distance; // Distance in mm
-    uint32_t timestamp;      // Unix timestamp
-} node_state_t;
 
 /**
  * UDP message structure for state updates
@@ -74,6 +71,7 @@ int get_neighbor_count(void);
 // State management
 void init_state(void);
 void update_state(void);
+void set_node_state(uint8_t state);
 void set_led_color(uint8_t r, uint8_t g, uint8_t b);
 void read_sensors(void);
 
@@ -99,7 +97,13 @@ void print_ip(uint8_t *ip);
 void platform_init(void);
 
 // Callbacks
+#if defined(ARDUINO)
+// Arduino framework - use simplified callbacks
+void mesh_event_handler(mesh_event_t event);
+#else
+// ESP-IDF framework
 esp_err_t mesh_event_handler(mesh_event_t event);
+#endif
 void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data);
 
 // ============================================================================

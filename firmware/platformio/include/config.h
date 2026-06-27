@@ -7,6 +7,26 @@
 #pragma once
 
 #include <stdint.h>
+#include <stdbool.h>
+
+// ============================================================================
+// Node State Definitions
+// ============================================================================
+
+#define NODE_STATE_BOOTING 0
+#define NODE_STATE_IDLE 1
+#define NODE_STATE_ACTIVE 2
+#define NODE_STATE_ERROR 3
+
+// Node state structure (defined here so it's available everywhere)
+typedef struct {
+    uint8_t state;           // Node state (0=idle, 1=active, 2=error, 3=booting)
+    uint8_t color[3];        // RGB color
+    int16_t temperature;     // Temperature \u00d710
+    uint8_t mmwave_presence; // 0 or 1
+    uint32_t mmwave_distance; // Distance in mm
+    uint32_t timestamp;      // Unix timestamp
+} node_state_t;
 
 // ============================================================================
 // Platform Detection

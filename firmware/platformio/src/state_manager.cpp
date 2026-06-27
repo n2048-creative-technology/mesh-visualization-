@@ -4,11 +4,10 @@
  * PlatformIO compatible for VS Code
  */
 
+#include "config.h"  // Include for NODE_STATE_* definitions
 #include "state_manager.h"
 #include "mesh_node.h"
-#include <esp_log.h>
-#include <driver/ledc.h>
-#include <esp_adc/adc_oneshot.h>
+#include "esp32_arduino_compat.h"
 
 static const char *TAG = "STATE_MANAGER";
 
@@ -16,22 +15,39 @@ static const char *TAG = "STATE_MANAGER";
 uint8_t led_pwm_channels[3] = {0};
 bool sensors_initialized = false;
 
-// LED PWM configuration
-#define LEDC_TIMER LEDC_TIMER_0
-#define LEDC_MODE LEDC_LOW_SPEED_MODE
-#define LEDC_OUTPUT_IO (1ULL << LED_RED_PIN) | (1ULL << LED_GREEN_PIN) | (1ULL << LED_BLUE_PIN)
-#define LEDC_CHANNEL_RED LEDC_CHANNEL_0
-#define LEDC_CHANNEL_GREEN LEDC_CHANNEL_1
-#define LEDC_CHANNEL_BLUE LEDC_CHANNEL_2
-#define LEDC_DUTY_RESOLUTION LEDC_TIMER_8_BIT
-#define LEDC_FREQUENCY 5000
-
-// ADC configuration for temperature sensor
-adc_oneshot_unit_handle_t adc_handle = NULL;
-
 // ============================================================================
 // Initialization Functions
 // ============================================================================
+
+/**
+ * Initialize state manager
+ */
+void init_state(void) {
+    ESP_LOGI(TAG, "Initializing state manager");
+    
+    // Initialize node state
+    memset(&node_state, 0, sizeof(node_state_t));
+    node_state.state = NODE_STATE_BOOTING;
+    node_state.color[0] = 0;    // Red
+    node_state.color[1] = 0;    // Green
+    node_state.color[2] = 255;  // Blue
+    node_state.temperature = 0;
+    node_state.mmwave_presence = 0;
+    node_state.mmwave_distance = 0;
+    node_state.timestamp = 0;
+    
+    // Initialize LEDs
+    init_leds();
+    
+    // Initialize sensors
+    init_sensors();
+    
+    // Set initial state
+    set_node_state(NODE_STATE_ACTIVE);
+    
+    sensors_initialized = true;
+    ESP_LOGI(TAG, "State manager initialized");
+}
 
 /**
  * Initialize LED PWM controllers
@@ -39,12 +55,25 @@ adc_oneshot_unit_handle_t adc_handle = NULL;
 void init_leds(void) {
     ESP_LOGI(TAG, "Initializing LEDs");
     
+    #if defined(ARDUINO)
+    // Arduino framework - use analogWrite for PWM
+    pinMode(LED_RED_PIN, OUTPUT);
+    pinMode(LED_GREEN_PIN, OUTPUT);
+    pinMode(LED_BLUE_PIN, OUTPUT);
+    
+    // Set initial LED state (off)
+    set_led_color(0, 0, 0);
+    
+    ESP_LOGI(TAG, "LEDs initialized (Arduino)");
+    
+    #else
+    // ESP-IDF framework - use LEDC for PWM
     // Configure LEDC timer
     ledc_timer_config_t ledc_timer = {
-        .speed_mode = LEDC_MODE,
-        .duty_resolution = LEDC_DUTY_RESOLUTION,
-        .timer_num = LEDC_TIMER,
-        .freq_hz = LEDC_FREQUENCY,
+        .speed_mode = LEDC_LOW_SPEED_MODE,
+        .duty_resolution = LEDC_TIMER_8_BIT,
+        .timer_num = LEDC_TIMER_0,
+        .freq_hz = 5000,
         .clk_cfg = LEDC_AUTO_CLK
     };
     
@@ -58,28 +87,28 @@ void init_leds(void) {
     ledc_channel_config_t ledc_channel[3] = {
         {
             .gpio_num = LED_RED_PIN,
-            .speed_mode = LEDC_MODE,
-            .channel = LEDC_CHANNEL_RED,
+            .speed_mode = LEDC_LOW_SPEED_MODE,
+            .channel = LEDC_CHANNEL_0,
             .intr_type = LEDC_INTR_DISABLE,
-            .timer_sel = LEDC_TIMER,
+            .timer_sel = LEDC_TIMER_0,
             .duty = 0,
             .hpoint = 0
         },
         {
             .gpio_num = LED_GREEN_PIN,
-            .speed_mode = LEDC_MODE,
-            .channel = LEDC_CHANNEL_GREEN,
+            .speed_mode = LEDC_LOW_SPEED_MODE,
+            .channel = LEDC_CHANNEL_1,
             .intr_type = LEDC_INTR_DISABLE,
-            .timer_sel = LEDC_TIMER,
+            .timer_sel = LEDC_TIMER_0,
             .duty = 0,
             .hpoint = 0
         },
         {
             .gpio_num = LED_BLUE_PIN,
-            .speed_mode = LEDC_MODE,
-            .channel = LEDC_CHANNEL_BLUE,
+            .speed_mode = LEDC_LOW_SPEED_MODE,
+            .channel = LEDC_CHANNEL_2,
             .intr_type = LEDC_INTR_DISABLE,
-            .timer_sel = LEDC_TIMER,
+            .timer_sel = LEDC_TIMER_0,
             .duty = 0,
             .hpoint = 0
         }
@@ -98,6 +127,7 @@ void init_leds(void) {
     set_led_color(0, 0, 0);
     
     ESP_LOGI(TAG, "LEDs initialized");
+    #endif
 }
 
 /**
@@ -106,7 +136,13 @@ void init_leds(void) {
 void init_sensors(void) {
     ESP_LOGI(TAG, "Initializing sensors");
     
-    // Initialize ADC for temperature sensor
+    #if defined(ARDUINO)
+    // Arduino framework - initialize sensor pins
+    pinMode(MMWAVE_PRESENCE_PIN, INPUT);
+    pinMode(TEMPERATURE_PIN, INPUT);
+    
+    #else
+    // ESP-IDF framework - initialize ADC for temperature sensor
     adc_oneshot_unit_init_cfg_t init_config = {
         .unit_id = ADC_UNIT_1,
         .ulp_mode = ADC_ULP_MODE_DISABLE,
@@ -118,271 +154,153 @@ void init_sensors(void) {
         return;
     }
     
-    // Configure ADC channel for temperature
-    adc_oneshot_chan_cfg_t config = {
-        .bitwidth = ADC_BITWIDTH_DEFAULT,
+    adc_oneshot_chan_cfg_t chan_cfg = {
         .atten = ADC_ATTEN_DB_11,
+        .bitwidth = ADC_BITWIDTH_12,
     };
     
-    err = adc_oneshot_config_channel(adc_handle, TEMPERATURE_PIN, &config);
+    err = adc_oneshot_config_channel(adc_handle, TEMPERATURE_PIN, &chan_cfg);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "ADC channel configuration failed: %s", esp_err_to_name(err));
         return;
     }
     
-    // Initialize mmWave sensor GPIO
+    // Initialize mmWave sensor pin
     gpio_config_t io_conf = {
-        .pin_bit_mask = (1ULL << MMWAVE_SENSOR_PIN),
+        .pin_bit_mask = (1ULL << MMWAVE_PRESENCE_PIN),
         .mode = GPIO_MODE_INPUT,
         .pull_up_en = GPIO_PULLUP_DISABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
         .intr_type = GPIO_INTR_DISABLE,
     };
+    gpio_config(&io_conf);
     
-    err = gpio_config(&io_conf);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "mmWave sensor GPIO configuration failed: %s", esp_err_to_name(err));
-        return;
-    }
+    #endif
     
-    sensors_initialized = true;
     ESP_LOGI(TAG, "Sensors initialized");
 }
 
+// ============================================================================
+// State Management
+// ============================================================================
+
 /**
- * Initialize state manager
+ * Update node state
  */
-void init_state_manager(void) {
-    init_leds();
-    init_sensors();
-    reset_node_state();
+void update_state(void) {
+    if (!sensors_initialized) return;
     
-    // Indicate boot state
-    led_indicate_boot();
+    // Read sensors
+    read_sensors();
     
-    ESP_LOGI(TAG, "State manager initialized");
+    // Update timestamp
+    node_state.timestamp = millis() / 1000; // Convert to seconds
+    
+    // Update LED color based on state
+    update_led_color();
+    
+    if (DEBUG_MESH) {
+        ESP_LOGD(TAG, "State updated: temp=%d, presence=%d, distance=%dmm",
+                 node_state.temperature, node_state.mmwave_presence, node_state.mmwave_distance);
+    }
 }
 
-// ============================================================================
-// LED Control Functions
-// ============================================================================
-
 /**
- * Set LED color using RGB values (0-255)
+ * Read sensor values
  */
-void set_led_color(uint8_t r, uint8_t g, uint8_t b) {
-    if (!led_pwm_channels[0]) return; // LEDs not initialized
+void read_sensors(void) {
+    if (!sensors_initialized) return;
     
-    // Scale 0-255 to 0-255 (8-bit resolution)
-    uint32_t duty_red = (r * 255) / 255;
-    uint32_t duty_green = (g * 255) / 255;
-    uint32_t duty_blue = (b * 255) / 255;
+    #if defined(ARDUINO)
+    // Arduino framework - read sensors
     
-    esp_err_t err;
-    err = ledc_set_duty(LEDC_MODE, LEDC_CHANNEL_RED, duty_red);
-    err |= ledc_set_duty(LEDC_MODE, LEDC_CHANNEL_GREEN, duty_green);
-    err |= ledc_set_duty(LEDC_MODE, LEDC_CHANNEL_BLUE, duty_blue);
+    // Read temperature (simplified - use analog input)
+    int temp_raw = analogRead(TEMPERATURE_PIN);
+    // Convert to temperature (this is a placeholder - actual conversion depends on sensor)
+    node_state.temperature = (int16_t)((temp_raw / 4095.0 * 3.3 - 0.5) * 100.0 * TEMPERATURE_SCALE);
     
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to set LED duty cycles: %s", esp_err_to_name(err));
-        return;
+    // Read mmWave presence
+    node_state.mmwave_presence = digitalRead(MMWAVE_PRESENCE_PIN);
+    
+    // For now, set distance to 0 (would need actual sensor)
+    node_state.mmwave_distance = 0;
+    
+    #else
+    // ESP-IDF framework - read sensors
+    
+    // Read temperature
+    int temp_raw = 0;
+    esp_err_t err = adc_oneshot_read(adc_handle, TEMPERATURE_PIN, &temp_raw);
+    if (err == ESP_OK) {
+        // Convert to temperature (this is a placeholder - actual conversion depends on sensor)
+        node_state.temperature = (int16_t)((temp_raw / 4095.0 * 3.3 - 0.5) * 100.0 * TEMPERATURE_SCALE);
     }
     
-    // Update duty cycles
-    ledc_update_duty(LEDC_MODE, LEDC_CHANNEL_RED);
-    ledc_update_duty(LEDC_MODE, LEDC_CHANNEL_GREEN);
-    ledc_update_duty(LEDC_MODE, LEDC_CHANNEL_BLUE);
+    // Read mmWave presence
+    node_state.mmwave_presence = gpio_get_level(MMWAVE_PRESENCE_PIN);
     
-    // Update node state color
+    // For now, set distance to 0 (would need actual sensor)
+    node_state.mmwave_distance = 0;
+    
+    #endif
+}
+
+/**
+ * Set LED color
+ */
+void set_led_color(uint8_t r, uint8_t g, uint8_t b) {
+    // Store color in node state
     node_state.color[0] = r;
     node_state.color[1] = g;
     node_state.color[2] = b;
+    
+    #if defined(ARDUINO)
+    // Arduino framework - use analogWrite for PWM
+    // Note: ESP32 analogWrite uses 8-bit resolution (0-255)
+    analogWrite(LED_RED_PIN, r);
+    analogWrite(LED_GREEN_PIN, g);
+    analogWrite(LED_BLUE_PIN, b);
+    
+    #else
+    // ESP-IDF framework - use LEDC for PWM
+    // LEDC uses duty cycle from 0 to (2^resolution - 1)
+    uint32_t max_duty = (1 << LEDC_TIMER_8_BIT) - 1;
+    
+    ledc_set_duty(LEDC_LOW_SPEED_MODE, led_pwm_channels[0], (r * max_duty) / 255);
+    ledc_set_duty(LEDC_LOW_SPEED_MODE, led_pwm_channels[1], (g * max_duty) / 255);
+    ledc_set_duty(LEDC_LOW_SPEED_MODE, led_pwm_channels[2], (b * max_duty) / 255);
+    
+    ledc_update_duty(LEDC_LOW_SPEED_MODE, led_pwm_channels[0]);
+    ledc_update_duty(LEDC_LOW_SPEED_MODE, led_pwm_channels[1]);
+    ledc_update_duty(LEDC_LOW_SPEED_MODE, led_pwm_channels[2]);
+    
+    #endif
 }
 
 /**
- * Set LED based on node state
+ * Update LED color based on node state
  */
-void set_led_state(uint8_t state) {
-    switch (state) {
-        case NODE_STATE_IDLE:
-            set_led_color(0, 0, 255); // Blue
+void update_led_color(void) {
+    switch(node_state.state) {
+        case NODE_STATE_BOOTING:
+            // Blue - booting
+            set_led_color(0, 0, 255);
             break;
         case NODE_STATE_ACTIVE:
-            set_led_color(0, 255, 0); // Green
+            // Green - active
+            set_led_color(0, 255, 0);
             break;
         case NODE_STATE_ERROR:
-            set_led_color(255, 0, 0); // Red
+            // Red - error
+            set_led_color(255, 0, 0);
             break;
-        case NODE_STATE_BOOTING:
-            set_led_color(255, 255, 0); // Yellow
+        case NODE_STATE_IDLE:
+            // Yellow - idle
+            set_led_color(255, 255, 0);
             break;
         default:
-            set_led_color(0, 0, 0); // Off
+            // White - unknown
+            set_led_color(255, 255, 255);
             break;
     }
-}
-
-/**
- * LED indication for boot state
- */
-void led_indicate_boot(void) {
-    set_led_state(NODE_STATE_BOOTING);
-}
-
-/**
- * LED indication for error state
- */
-void led_indicate_error(void) {
-    set_led_state(NODE_STATE_ERROR);
-}
-
-/**
- * LED indication for active state
- */
-void led_indicate_active(void) {
-    set_led_state(NODE_STATE_ACTIVE);
-}
-
-// ============================================================================
-// Sensor Reading Functions
-// ============================================================================
-
-/**
- * Read temperature from ADC
- */
-void read_temperature(void) {
-    if (!sensors_initialized || !adc_handle) {
-        node_state.temperature = 0;
-        return;
-    }
-    
-    int raw_value = 0;
-    esp_err_t err = adc_oneshot_read(adc_handle, TEMPERATURE_PIN, &raw_value);
-    
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to read temperature: %s", esp_err_to_name(err));
-        node_state.temperature = 0;
-        return;
-    }
-    
-    // Convert ADC reading to temperature
-    // This is a placeholder - actual conversion depends on your sensor
-    // For ESP32 internal temperature sensor (not accurate):
-    // float temp = (raw_value - 500) / 10.0;
-    // For external sensor, implement proper calibration
-    float temperature_c = (raw_value * 3.3 / 4095.0 - 0.5) * 100.0; // Example conversion
-    
-    // Store as int16_t * 10
-    node_state.temperature = (int16_t)(temperature_c * TEMPERATURE_SCALE);
-    
-    if (DEBUG_MESH) {
-        ESP_LOGD(TAG, "Temperature: %.1f°C (raw: %d)", temperature_c, raw_value);
-    }
-}
-
-/**
- * Read mmWave sensor
- */
-void read_mmwave_sensor(void) {
-    if (!sensors_initialized) {
-        node_state.mmwave_presence = 0;
-        node_state.mmwave_distance = 0;
-        return;
-    }
-    
-    // Read presence (digital input)
-    node_state.mmwave_presence = gpio_get_level(MMWAVE_SENSOR_PIN);
-    
-    // For distance, you would typically use I2C/SPI to read from the sensor
-    // This is a placeholder - implement based on your actual sensor
-    if (node_state.mmwave_presence) {
-        // Simulate distance (in production, read from sensor)
-        node_state.mmwave_distance = 1500; // 1.5m in mm
-    } else {
-        node_state.mmwave_distance = 0;
-    }
-    
-    if (DEBUG_MESH) {
-        ESP_LOGD(TAG, "mmWave: presence=%d, distance=%d mm", 
-                 node_state.mmwave_presence, node_state.mmwave_distance);
-    }
-}
-
-/**
- * Update all sensors
- */
-void update_all_sensors(void) {
-    read_temperature();
-    read_mmwave_sensor();
-}
-
-// ============================================================================
-// State Management Functions
-// ============================================================================
-
-/**
- * Set node state
- */
-void set_node_state(uint8_t state) {
-    node_state.state = state;
-    set_led_state(state);
-    
-    if (DEBUG_MESH) {
-        ESP_LOGD(TAG, "Node state changed to: %d", state);
-    }
-}
-
-/**
- * Update node state (timestamp, etc.)
- */
-void update_node_state(void) {
-    node_state.timestamp = (uint32_t)time(NULL);
-    update_all_sensors();
-}
-
-/**
- * Reset node state to defaults
- */
-void reset_node_state(void) {
-    memset(&node_state, 0, sizeof(node_state_t));
-    node_state.state = NODE_STATE_BOOTING;
-    node_state.color[0] = 255;
-    node_state.color[1] = 255;
-    node_state.color[2] = 0;
-    node_state.temperature = 0;
-    node_state.mmwave_presence = 0;
-    node_state.mmwave_distance = 0;
-    node_state.timestamp = 0;
-}
-
-// ============================================================================
-// Utility Functions
-// ============================================================================
-
-/**
- * Get current node state
- */
-uint8_t get_node_state(void) {
-    return node_state.state;
-}
-
-/**
- * Get temperature in Celsius
- */
-float get_temperature_c(void) {
-    return (float)node_state.temperature / TEMPERATURE_SCALE;
-}
-
-/**
- * Get mmWave presence detection
- */
-bool get_mmwave_presence(void) {
-    return node_state.mmwave_presence != 0;
-}
-
-/**
- * Get mmWave distance in mm
- */
-uint32_t get_mmwave_distance(void) {
-    return node_state.mmwave_distance;
 }

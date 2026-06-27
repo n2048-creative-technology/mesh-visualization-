@@ -8,14 +8,7 @@
 #include "mesh_node.h"
 #include "beacon_monitor.h"
 #include "state_manager.h"
-#include <esp_log.h>
-#include <esp_wifi.h>
-#include <esp_mesh.h>
-#include <esp_netif.h>
-#include <esp_event.h>
-#include <esp_timer.h>
-#include <lwip/sockets.h>
-#include <lwip/netdb.h>
+#include "esp32_arduino_compat.h"
 #include <string.h>
 #include <time.h>
 
@@ -31,9 +24,9 @@ int udp_socket = -1;
 bool mesh_initialized = false;
 bool wifi_initialized = false;
 
-// Timer handles
-esp_timer_handle_t state_update_timer = NULL;
-esp_timer_handle_t neighbor_cleanup_timer = NULL;
+// Timer handles (simplified for Arduino)
+void* state_update_timer = NULL;
+void* neighbor_cleanup_timer = NULL;
 
 // ============================================================================
 // Platform-Specific Initialization
@@ -76,6 +69,9 @@ void platform_init(void) {
     #endif
     
     ESP_LOGI(TAG, "Using WiFi channel: %d", WIFI_CHANNEL);
+    
+    // Initialize sensors and LEDs
+    init_state();
 }
 
 // ============================================================================
@@ -88,6 +84,22 @@ void platform_init(void) {
 void init_wifi(void) {
     ESP_LOGI(TAG, "Initializing WiFi");
     
+    #if defined(ARDUINO)
+    // Arduino framework
+    WiFi.mode(WIFI_STA);
+    
+    // Get MAC address
+    uint8_t* arduino_mac = WiFi.macAddress();
+    for (int i = 0; i < 6; i++) {
+        node_mac[i] = arduino_mac[i];
+    }
+    
+    wifi_initialized = true;
+    ESP_LOGI(TAG, "WiFi initialized, MAC: ");
+    print_mac(node_mac);
+    
+    #else
+    // ESP-IDF framework
     // Initialize TCP/IP stack
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
@@ -96,8 +108,8 @@ void init_wifi(void) {
     esp_netif_create_default_wifi_mesh_netifs(1);
     
     // Initialize WiFi with mesh configuration
-    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+    void* cfg = NULL;
+    ESP_ERROR_CHECK(esp_wifi_init(cfg));
     
     // Register WiFi event handler
     ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL, NULL));
@@ -115,12 +127,51 @@ void init_wifi(void) {
     wifi_initialized = true;
     ESP_LOGI(TAG, "WiFi initialized, MAC: ");
     print_mac(node_mac);
+    #endif
 }
 
 /**
- * Initialize ESP-WiFi-Mesh
+ * Initialize ESP-WiFi-Mesh (or simulated mesh for Arduino)
  */
 void init_mesh(void) {
+    ESP_LOGI(TAG, "Initializing mesh network");
+    
+    #if defined(ARDUINO)
+    // Arduino framework - simulate mesh initialization
+    // In Arduino, we'll use WiFi in STA mode and broadcast UDP messages
+    
+    // Initialize WiFi
+    init_wifi();
+    
+    // Connect to WiFi network (for testing)
+    WiFi.begin(MESH_ROUTER_SSID, MESH_ROUTER_PASS);
+    
+    // Wait for connection
+    int attempts = 0;
+    while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+        delay(500);
+        attempts++;
+        ESP_LOGI(TAG, "Connecting to WiFi... attempt %d", attempts);
+    }
+    
+    if (WiFi.status() == WL_CONNECTED) {
+        ESP_LOGI(TAG, "Connected to WiFi network");
+        ESP_LOGI(TAG, "IP address: %s", WiFi.localIP().toString().c_str());
+    } else {
+        ESP_LOGW(TAG, "Failed to connect to WiFi, using AP mode");
+        WiFi.mode(WIFI_AP);
+        WiFi.softAP(MESH_ROUTER_SSID, MESH_ROUTER_PASS);
+        ESP_LOGI(TAG, "AP mode started, IP: %s", WiFi.softAPIP().toString().c_str());
+    }
+    
+    // Initialize neighbor list
+    init_neighbor_list();
+    
+    mesh_initialized = true;
+    ESP_LOGI(TAG, "Mesh network initialized (Arduino simulation)");
+    
+    #else
+    // ESP-IDF framework
     ESP_LOGI(TAG, "Initializing ESP-WiFi-Mesh");
     
     // Mesh configuration
@@ -144,19 +195,6 @@ void init_mesh(void) {
         .mesh_ap.max_retries = 3,
         .mesh_ap.beacon_interval = 100, // TUs (1.024ms)
         .mesh_ap.listen_interval = 3,
-        .mesh_ap.nonmesh_ap_probe_interval = 30000, // ms
-        .mesh_ap.mesh_ap_idle_interval = 10000, // ms
-        .mesh_ap.mesh_ap_max_age = 60000, // ms
-        .mesh_ap.mesh_ap_fail_interval = 3000, // ms
-        .mesh_ap.mesh_ap_select_interval = 1000, // ms
-        .mesh_ap.mesh_ap_select_random_interval = 100, // ms
-        .mesh_ap.mesh_ap_switch_interval = 1000, // ms
-        .mesh_ap.mesh_ap_switch_random_interval = 100, // ms
-        .mesh_ap.mesh_ap_beacon_interval = 100, // TUs
-        .mesh_ap.mesh_ap_listen_interval = 3,
-        .mesh_ap.mesh_ap_scan_interval = 30000, // ms
-        .mesh_ap.mesh_ap_idle_interval = 10000, // ms
-        .mesh_ap.mesh_ap_max_age = 60000, // ms
     };
     
     // Set mesh configuration
@@ -184,8 +222,12 @@ void init_mesh(void) {
         ESP_LOGI(TAG, "Mesh node is ACTIVE");
     }
     
+    // Initialize neighbor list
+    init_neighbor_list();
+    
     mesh_initialized = true;
     ESP_LOGI(TAG, "ESP-WiFi-Mesh initialized");
+    #endif
 }
 
 /**
@@ -194,6 +236,35 @@ void init_mesh(void) {
 void init_udp(void) {
     ESP_LOGI(TAG, "Initializing UDP socket");
     
+    #if defined(ARDUINO)
+    // Arduino framework - use our wrapper
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(UDP_PORT);
+    addr.sin_addr.s_addr = INADDR_ANY;
+    
+    udp_socket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (udp_socket < 0) {
+        ESP_LOGE(TAG, "Failed to create UDP socket: %d", errno);
+        return;
+    }
+    
+    if (bind(udp_socket, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+        ESP_LOGE(TAG, "Failed to bind UDP socket: %d", errno);
+        close(udp_socket);
+        udp_socket = -1;
+        return;
+    }
+    
+    // Set socket to non-blocking
+    int flags = fcntl(udp_socket, F_GETFL, 0);
+    fcntl(udp_socket, F_SETFL, flags | O_NONBLOCK);
+    
+    ESP_LOGI(TAG, "UDP socket initialized on port %d", UDP_PORT);
+    
+    #else
+    // ESP-IDF framework
     // Create UDP socket
     udp_socket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (udp_socket < 0) {
@@ -201,124 +272,108 @@ void init_udp(void) {
         return;
     }
     
-    // Set socket options for broadcast
-    int broadcast = 1;
-    if (setsockopt(udp_socket, SOL_SOCKET, SO_BROADCAST, &broadcast, sizeof(broadcast)) < 0) {
-        ESP_LOGE(TAG, "Failed to set broadcast option: %d", errno);
-    }
-    
     // Bind socket
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
     addr.sin_port = htons(UDP_PORT);
-    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    addr.sin_addr.s_addr = INADDR_ANY;
     
-    if (bind(udp_socket, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+    if (bind(udp_socket, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
         ESP_LOGE(TAG, "Failed to bind UDP socket: %d", errno);
         close(udp_socket);
         udp_socket = -1;
         return;
     }
     
+    // Set socket to non-blocking
+    int flags = fcntl(udp_socket, F_GETFL, 0);
+    fcntl(udp_socket, F_SETFL, flags | O_NONBLOCK);
+    
     ESP_LOGI(TAG, "UDP socket initialized on port %d", UDP_PORT);
+    #endif
 }
 
 // ============================================================================
-// Neighbor Management Functions
+// Neighbor Management
 // ============================================================================
 
 /**
  * Initialize neighbor list
  */
 void init_neighbor_list(void) {
-    memset(neighbor_list, 0, sizeof(neighbor_list));
+    ESP_LOGI(TAG, "Initializing neighbor list");
+    
     for (int i = 0; i < MAX_NEIGHBORS; i++) {
         neighbor_list[i].active = false;
         neighbor_list[i].rssi = -127; // Invalid RSSI
         neighbor_list[i].last_seen = 0;
+        memset(neighbor_list[i].mac, 0, 6);
+        memset(neighbor_list[i].ip, 0, 4);
     }
 }
 
 /**
- * Update neighbor list with new RSSI reading
+ * Update neighbor list with new information
  */
 void update_neighbor_list(uint8_t *mac, int8_t rssi) {
-    if (mac == NULL || memcmp(mac, node_mac, 6) == 0) {
-        return; // Ignore null MAC or our own MAC
-    }
-    
-    uint32_t current_time = esp_timer_get_time() / 1000; // ms
+    if (!mac) return;
     
     // Check if neighbor already exists
-    int existing_index = -1;
     for (int i = 0; i < MAX_NEIGHBORS; i++) {
         if (neighbor_list[i].active && memcmp(neighbor_list[i].mac, mac, 6) == 0) {
-            existing_index = i;
-            break;
-        }
-    }
-    
-    if (existing_index >= 0) {
-        // Update existing neighbor
-        int8_t rssi_diff = abs(rssi - neighbor_list[existing_index].rssi);
-        
-        // Only update if RSSI changed significantly or it's been a while
-        if (rssi_diff >= RSSI_THRESHOLD || 
-            (current_time - neighbor_list[existing_index].last_seen) > 1000) {
-            neighbor_list[existing_index].rssi = rssi;
-            neighbor_list[existing_index].last_seen = current_time;
+            // Update existing neighbor
+            neighbor_list[i].rssi = rssi;
+            neighbor_list[i].last_seen = millis();
             
             if (DEBUG_NEIGHBORS) {
                 ESP_LOGD(TAG, "Updated neighbor: ");
                 print_mac(mac);
-                ESP_LOGD(TAG, " RSSI: %d -> %d", neighbor_list[existing_index].rssi, rssi);
+                ESP_LOGD(TAG, " RSSI: %d dBm", rssi);
             }
+            return;
         }
-    } else {
-        // Find an inactive slot or the weakest neighbor
-        int replace_index = -1;
-        int8_t weakest_rssi = -30; // Start with a strong signal
-        
-        for (int i = 0; i < MAX_NEIGHBORS; i++) {
-            if (!neighbor_list[i].active) {
-                replace_index = i;
-                break;
-            }
+    }
+    
+    // Find an empty slot
+    for (int i = 0; i < MAX_NEIGHBORS; i++) {
+        if (!neighbor_list[i].active) {
+            // Add new neighbor
+            memcpy(neighbor_list[i].mac, mac, 6);
+            neighbor_list[i].rssi = rssi;
+            neighbor_list[i].last_seen = millis();
+            neighbor_list[i].active = true;
             
-            // Track weakest neighbor for potential replacement
-            if (neighbor_list[i].rssi < weakest_rssi) {
-                weakest_rssi = neighbor_list[i].rssi;
-                replace_index = i;
-            }
-        }
-        
-        // Only add if we have space or if this RSSI is better than the weakest
-        if (replace_index >= 0 && (rssi > weakest_rssi || !neighbor_list[replace_index].active)) {
-            memcpy(neighbor_list[replace_index].mac, mac, 6);
-            neighbor_list[replace_index].rssi = rssi;
-            neighbor_list[replace_index].last_seen = current_time;
-            neighbor_list[replace_index].active = true;
-            
-            // Resolve IP address
-            mac_to_ip(mac, neighbor_list[replace_index].ip);
+            // Generate IP from MAC
+            mac_to_ip(mac, neighbor_list[i].ip);
             
             if (DEBUG_NEIGHBORS) {
                 ESP_LOGD(TAG, "Added new neighbor: ");
                 print_mac(mac);
-                ESP_LOGD(TAG, " RSSI: %d", rssi);
+                ESP_LOGD(TAG, " RSSI: %d dBm", rssi);
             }
+            return;
         }
     }
     
-    // Sort neighbors by RSSI (strongest first)
-    for (int i = 0; i < MAX_NEIGHBORS - 1; i++) {
-        for (int j = i + 1; j < MAX_NEIGHBORS; j++) {
-            if (neighbor_list[i].active && neighbor_list[j].active &&
-                neighbor_list[i].rssi < neighbor_list[j].rssi) {
-                neighbor_info_t temp = neighbor_list[i];
-                neighbor_list[i] = neighbor_list[j];
-                neighbor_list[j] = temp;
+    // No space for new neighbor
+    ESP_LOGW(TAG, "Neighbor list full, cannot add new neighbor");
+}
+
+/**
+ * Cleanup inactive neighbors
+ */
+void cleanup_inactive_neighbors(void) {
+    uint32_t current_time = millis();
+    
+    for (int i = 0; i < MAX_NEIGHBORS; i++) {
+        if (neighbor_list[i].active && 
+            (current_time - neighbor_list[i].last_seen) > NEIGHBOR_TIMEOUT_MS) {
+            neighbor_list[i].active = false;
+            
+            if (DEBUG_NEIGHBORS) {
+                ESP_LOGD(TAG, "Removed inactive neighbor: ");
+                print_mac(neighbor_list[i].mac);
             }
         }
     }
@@ -328,16 +383,19 @@ void update_neighbor_list(uint8_t *mac, int8_t rssi) {
  * Get neighbor by MAC address
  */
 neighbor_info_t* get_neighbor_by_mac(uint8_t *mac) {
+    if (!mac) return NULL;
+    
     for (int i = 0; i < MAX_NEIGHBORS; i++) {
         if (neighbor_list[i].active && memcmp(neighbor_list[i].mac, mac, 6) == 0) {
             return &neighbor_list[i];
         }
     }
+    
     return NULL;
 }
 
 /**
- * Get number of active neighbors
+ * Get neighbor count
  */
 int get_neighbor_count(void) {
     int count = 0;
@@ -349,147 +407,129 @@ int get_neighbor_count(void) {
     return count;
 }
 
+// ============================================================================
+// State Management
+// ============================================================================
+
 /**
- * Cleanup inactive neighbors (not seen for NEIGHBOR_TIMEOUT_MS)
+ * Set node state
  */
-void cleanup_inactive_neighbors(void) {
-    uint32_t current_time = esp_timer_get_time() / 1000; // ms
+void set_node_state(uint8_t state) {
+    node_state.state = state;
+    node_state.timestamp = millis() / 1000; // Convert to seconds
     
-    for (int i = 0; i < MAX_NEIGHBORS; i++) {
-        if (neighbor_list[i].active && 
-            (current_time - neighbor_list[i].last_seen) > NEIGHBOR_TIMEOUT_MS) {
-            if (DEBUG_NEIGHBORS) {
-                ESP_LOGD(TAG, "Removing inactive neighbor: ");
-                print_mac(neighbor_list[i].mac);
-            }
-            neighbor_list[i].active = false;
-            neighbor_list[i].rssi = -127;
-        }
-    }
+    ESP_LOGI(TAG, "Node state set to: %d", state);
 }
 
 // ============================================================================
-// State Management Functions
+// Communication
 // ============================================================================
 
 /**
- * Initialize node state
- */
-void init_state(void) {
-    reset_node_state();
-    set_node_state(NODE_STATE_BOOTING);
-}
-
-/**
- * Update node state (called periodically)
- */
-void update_state(void) {
-    update_node_state();
-    
-    // Send state to neighbors
-    send_state_to_neighbors();
-    
-    // Adjust TX power based on neighbors
-    adjust_tx_power();
-}
-
-// ============================================================================
-// Communication Functions
-// ============================================================================
-
-/**
- * Send state update to all neighbors via UDP unicast
+ * Send state to neighbors
  */
 void send_state_to_neighbors(void) {
-    if (udp_socket < 0) {
-        ESP_LOGE(TAG, "UDP socket not initialized");
-        return;
-    }
+    if (!mesh_initialized) return;
     
-    // Prepare message
-    memset(&current_message, 0, sizeof(mesh_message_t));
+    // Build message
     current_message.version = PROTOCOL_VERSION;
     current_message.msg_type = MSG_TYPE_STATE_UPDATE;
     memcpy(current_message.mac, node_mac, 6);
     memcpy(&current_message.state, &node_state, sizeof(node_state_t));
     
-    // Copy neighbor list
-    for (int i = 0; i < MAX_NEIGHBORS; i++) {
+    // Add neighbors to message
+    int neighbor_count = get_neighbor_count();
+    for (int i = 0; i < MIN(neighbor_count, MAX_NEIGHBORS); i++) {
         if (neighbor_list[i].active) {
-            memcpy(current_message.neighbors[i].mac, neighbor_list[i].mac, 6);
-            current_message.neighbors[i].rssi = neighbor_list[i].rssi;
+            memcpy(&current_message.neighbors[i], &neighbor_list[i], sizeof(neighbor_info_t));
         }
     }
     
     // Calculate checksum
     current_message.checksum = calculate_checksum(&current_message);
     
-    // Send to each neighbor
+    // Send to all neighbors
     for (int i = 0; i < MAX_NEIGHBORS; i++) {
         if (neighbor_list[i].active) {
-            struct sockaddr_in dest_addr;
-            memset(&dest_addr, 0, sizeof(dest_addr));
-            dest_addr.sin_family = AF_INET;
-            dest_addr.sin_port = htons(UDP_PORT);
-            dest_addr.sin_addr.s_addr = htonl(
-                (neighbor_list[i].ip[0] << 24) |
-                (neighbor_list[i].ip[1] << 16) |
-                (neighbor_list[i].ip[2] << 8) |
-                neighbor_list[i].ip[3]
-            );
+            struct sockaddr_in dest;
+            memset(&dest, 0, sizeof(dest));
+            dest.sin_family = AF_INET;
+            dest.sin_port = htons(UDP_PORT);
+            memcpy(&dest.sin_addr.s_addr, neighbor_list[i].ip, 4);
             
-            if (sendto(udp_socket, &current_message, sizeof(mesh_message_t), 0,
-                       (struct sockaddr *)&dest_addr, sizeof(dest_addr)) < 0) {
-                ESP_LOGE(TAG, "Failed to send UDP to neighbor %d: %d", i, errno);
-            } else if (DEBUG_UDP) {
-                ESP_LOGD(TAG, "Sent UDP state to neighbor: ");
-                print_mac(neighbor_list[i].mac);
-            }
+            sendto(udp_socket, &current_message, sizeof(current_message), 0,
+                   (struct sockaddr*)&dest, sizeof(dest));
         }
     }
     
-    // Also forward to visualization subscriber
-    forward_to_visualization(&current_message);
+    if (DEBUG_UDP) {
+        ESP_LOGD(TAG, "Sent state update to %d neighbors", neighbor_count);
+    }
 }
 
 /**
- * Forward message to visualization subscriber via mesh
+ * Forward message to visualization server
  */
 void forward_to_visualization(mesh_message_t *msg) {
-    if (!mesh_initialized) {
+    if (!msg) return;
+    
+    struct sockaddr_in dest;
+    memset(&dest, 0, sizeof(dest));
+    dest.sin_family = AF_INET;
+    dest.sin_port = htons(VISUALIZATION_PORT);
+    
+    // Parse VISUALIZATION_IP
+    IPAddress viz_ip;
+    if (viz_ip.fromString(VISUALIZATION_IP)) {
+        dest.sin_addr.s_addr = viz_ip;
+    } else {
+        ESP_LOGW(TAG, "Invalid visualization IP: %s", VISUALIZATION_IP);
         return;
     }
     
-    // For now, we'll use UDP broadcast to the visualization IP
-    // In a real mesh, we would use esp_mesh_send()
+    sendto(udp_socket, msg, sizeof(mesh_message_t), 0,
+           (struct sockaddr*)&dest, sizeof(dest));
     
-    struct sockaddr_in dest_addr;
-    memset(&dest_addr, 0, sizeof(dest_addr));
-    dest_addr.sin_family = AF_INET;
-    dest_addr.sin_port = htons(VISUALIZATION_PORT);
-    
-    // Parse visualization IP
-    uint32_t ip_addr = 0;
-    const char *ip_str = VISUALIZATION_IP;
-    char ip_copy[16];
-    strncpy(ip_copy, ip_str, sizeof(ip_copy) - 1);
-    ip_copy[sizeof(ip_copy) - 1] = '\0';
-    
-    char *token = strtok(ip_copy, ".");
-    for (int i = 0; i < 4 && token != NULL; i++) {
-        ip_addr = (ip_addr << 8) | atoi(token);
-        token = strtok(NULL, ".");
+    if (DEBUG_UDP) {
+        ESP_LOGD(TAG, "Forwarded message to visualization server");
     }
-    dest_addr.sin_addr.s_addr = htonl(ip_addr);
+}
+
+/**
+ * Broadcast state to all nodes
+ */
+void broadcast_state(void) {
+    if (!mesh_initialized) return;
     
-    // Send via UDP (will be forwarded by mesh if needed)
-    if (udp_socket >= 0) {
-        if (sendto(udp_socket, msg, sizeof(mesh_message_t), 0,
-                   (struct sockaddr *)&dest_addr, sizeof(dest_addr)) < 0) {
-            ESP_LOGE(TAG, "Failed to forward to visualization: %d", errno);
-        } else if (DEBUG_UDP) {
-            ESP_LOGD(TAG, "Forwarded to visualization: " VISUALIZATION_IP);
+    // Build message
+    current_message.version = PROTOCOL_VERSION;
+    current_message.msg_type = MSG_TYPE_STATE_UPDATE;
+    memcpy(current_message.mac, node_mac, 6);
+    memcpy(&current_message.state, &node_state, sizeof(node_state_t));
+    
+    // Add neighbors to message
+    int neighbor_count = get_neighbor_count();
+    for (int i = 0; i < MIN(neighbor_count, MAX_NEIGHBORS); i++) {
+        if (neighbor_list[i].active) {
+            memcpy(&current_message.neighbors[i], &neighbor_list[i], sizeof(neighbor_info_t));
         }
+    }
+    
+    // Calculate checksum
+    current_message.checksum = calculate_checksum(&current_message);
+    
+    // Broadcast to all nodes
+    struct sockaddr_in dest;
+    memset(&dest, 0, sizeof(dest));
+    dest.sin_family = AF_INET;
+    dest.sin_port = htons(UDP_PORT);
+    dest.sin_addr.s_addr = INADDR_BROADCAST;
+    
+    sendto(udp_socket, &current_message, sizeof(current_message), 0,
+           (struct sockaddr*)&dest, sizeof(dest));
+    
+    if (DEBUG_UDP) {
+        ESP_LOGD(TAG, "Broadcasted state to all nodes");
     }
 }
 
@@ -497,95 +537,72 @@ void forward_to_visualization(mesh_message_t *msg) {
  * Send UDP message to specific destination
  */
 void send_udp_message(uint8_t *dest_ip, uint16_t dest_port, mesh_message_t *msg) {
-    if (udp_socket < 0) return;
+    if (!msg || !dest_ip) return;
     
-    struct sockaddr_in dest_addr;
-    memset(&dest_addr, 0, sizeof(dest_addr));
-    dest_addr.sin_family = AF_INET;
-    dest_addr.sin_port = htons(dest_port);
-    dest_addr.sin_addr.s_addr = htonl(
-        (dest_ip[0] << 24) |
-        (dest_ip[1] << 16) |
-        (dest_ip[2] << 8) |
-        dest_ip[3]
-    );
+    struct sockaddr_in dest;
+    memset(&dest, 0, sizeof(dest));
+    dest.sin_family = AF_INET;
+    dest.sin_port = htons(dest_port);
+    memcpy(&dest.sin_addr.s_addr, dest_ip, 4);
     
-    if (sendto(udp_socket, msg, sizeof(mesh_message_t), 0,
-               (struct sockaddr *)&dest_addr, sizeof(dest_addr)) < 0) {
-        ESP_LOGE(TAG, "Failed to send UDP message: %d", errno);
-    }
+    sendto(udp_socket, msg, sizeof(mesh_message_t), 0,
+           (struct sockaddr*)&dest, sizeof(dest));
 }
 
 // ============================================================================
-// TX Power Management Functions
+// TX Power Management
 // ============================================================================
 
 /**
- * Initialize TX power management
+ * Initialize TX power
  */
 void init_tx_power(void) {
-    // Set initial TX power
-    esp_wifi_set_max_tx_power(current_tx_power);
+    ESP_LOGI(TAG, "Initializing TX power management");
     
-    if (DEBUG_TX_POWER) {
-        ESP_LOGD(TAG, "Initial TX power set to: %d (%.1f dBm)", 
-                 current_tx_power, (current_tx_power - 8) / 4.0);
-    }
+    #if defined(ARDUINO)
+    // Arduino framework - set initial TX power
+    // Note: ESP32 Arduino doesn't have direct TX power control
+    // This is a limitation of the Arduino framework
+    current_tx_power = 8; // Default: 0 dBm
+    
+    #else
+    // ESP-IDF framework
+    esp_wifi_set_max_tx_power(MAX_TX_POWER);
+    current_tx_power = MIN_TX_POWER;
+    esp_wifi_set_tx_power(current_tx_power);
+    
+    #endif
+    
+    ESP_LOGI(TAG, "Initial TX power: %d dBm", current_tx_power);
 }
 
 /**
- * Adjust TX power based on weakest neighbor RSSI
+ * Adjust TX power based on neighbor RSSI
  */
 void adjust_tx_power(void) {
-    int8_t weakest_rssi = -30; // Start with strong signal
-    bool has_neighbors = false;
+    if (!mesh_initialized) return;
     
-    // Find weakest neighbor RSSI
-    for (int i = 0; i < MAX_NEIGHBORS; i++) {
-        if (neighbor_list[i].active) {
-            has_neighbors = true;
-            if (neighbor_list[i].rssi < weakest_rssi) {
-                weakest_rssi = neighbor_list[i].rssi;
-            }
-        }
-    }
-    
-    if (!has_neighbors) {
-        // No neighbors, use minimum power
-        if (current_tx_power != MIN_TX_POWER) {
-            current_tx_power = MIN_TX_POWER;
-            esp_wifi_set_max_tx_power(current_tx_power);
-            if (DEBUG_TX_POWER) {
-                ESP_LOGD(TAG, "No neighbors, TX power set to minimum: %d", current_tx_power);
-            }
-        }
-        return;
-    }
-    
-    // Calculate required TX power
     int8_t required_power = calculate_required_tx_power();
     
-    // Adjust TX power towards required power
-    if (required_power > current_tx_power) {
-        current_tx_power = MIN(current_tx_power + TX_POWER_STEP, MAX_TX_POWER);
-    } else if (required_power < current_tx_power) {
-        current_tx_power = MAX(current_tx_power - TX_POWER_STEP, MIN_TX_POWER);
-    }
-    
-    // Set new TX power
-    if (esp_wifi_set_max_tx_power(current_tx_power) == ESP_OK) {
+    if (required_power != current_tx_power) {
+        current_tx_power = required_power;
+        
+        #if !defined(ARDUINO)
+        // ESP-IDF framework - set TX power
+        esp_wifi_set_tx_power(current_tx_power);
+        #endif
+        
         if (DEBUG_TX_POWER) {
-            ESP_LOGD(TAG, "Adjusted TX power: %d (%.1f dBm), weakest RSSI: %d dBm", 
-                     current_tx_power, (current_tx_power - 8) / 4.0, weakest_rssi);
+            ESP_LOGD(TAG, "Adjusted TX power to: %d dBm", current_tx_power);
         }
     }
 }
 
 /**
- * Calculate required TX power based on weakest neighbor RSSI
+ * Calculate required TX power based on weakest neighbor
  */
 int8_t calculate_required_tx_power(void) {
-    int8_t weakest_rssi = -30;
+    int8_t weakest_rssi = -127; // Start with worst possible RSSI
     
     for (int i = 0; i < MAX_NEIGHBORS; i++) {
         if (neighbor_list[i].active && neighbor_list[i].rssi < weakest_rssi) {
@@ -593,18 +610,13 @@ int8_t calculate_required_tx_power(void) {
         }
     }
     
-    // Simple proportional control: adjust TX power to maintain target RSSI
-    // If RSSI is too low (more negative), increase TX power
-    // If RSSI is too high (less negative), decrease TX power
+    if (weakest_rssi == -127) {
+        // No neighbors, use minimum power
+        return MIN_TX_POWER;
+    }
     
-    int8_t rssi_diff = TARGET_RSSI - weakest_rssi;
-    
-    // Convert RSSI difference to TX power adjustment
-    // Each 4 dB of TX power change ≈ 1 dBm RSSI change at receiver
-    // So we need to adjust by (rssi_diff / 4) * 4 (since ESP32 TX power is in 4 dB steps)
-    int8_t adjustment = (rssi_diff / 4) * 4;
-    
-    int8_t required_power = current_tx_power + adjustment;
+    // Calculate required power to achieve target RSSI
+    int8_t required_power = current_tx_power + (TARGET_RSSI - weakest_rssi);
     
     // Clamp to valid range
     return CLAMP(required_power, MIN_TX_POWER, MAX_TX_POWER);
@@ -615,14 +627,18 @@ int8_t calculate_required_tx_power(void) {
 // ============================================================================
 
 /**
- * Calculate simple checksum for message
+ * Calculate checksum for a message
  */
 uint16_t calculate_checksum(mesh_message_t *msg) {
-    uint16_t checksum = 0;
-    uint8_t *data = (uint8_t *)msg;
-    size_t len = sizeof(mesh_message_t) - sizeof(msg->checksum);
+    if (!msg) return 0;
     
-    for (size_t i = 0; i < len; i++) {
+    uint16_t checksum = 0;
+    uint8_t *data = (uint8_t*)msg;
+    
+    // Calculate checksum over all bytes except the checksum field itself
+    size_t length = sizeof(mesh_message_t) - sizeof(msg->checksum);
+    
+    for (size_t i = 0; i < length; i++) {
         checksum += data[i];
     }
     
@@ -630,17 +646,22 @@ uint16_t calculate_checksum(mesh_message_t *msg) {
 }
 
 /**
- * Verify message checksum
+ * Verify checksum of a message
  */
 bool verify_checksum(mesh_message_t *msg) {
+    if (!msg) return false;
+    
     uint16_t calculated = calculate_checksum(msg);
-    return calculated == msg->checksum;
+    return (calculated == msg->checksum);
 }
 
 /**
- * Convert MAC address to static IP (192.168.1.<last_byte>)
+ * Convert MAC address to IP address
  */
 void mac_to_ip(uint8_t *mac, uint8_t *ip) {
+    if (!mac || !ip) return;
+    
+    // Simple mapping: 192.168.1.<last_byte_of_mac>
     ip[0] = 192;
     ip[1] = 168;
     ip[2] = 1;
@@ -651,23 +672,19 @@ void mac_to_ip(uint8_t *mac, uint8_t *ip) {
  * Print MAC address
  */
 void print_mac(uint8_t *mac) {
-    if (mac == NULL) {
-        ESP_LOGD(TAG, "NULL");
-        return;
-    }
-    ESP_LOGD(TAG, "%02X:%02X:%02X:%02X:%02X:%02X",
-             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    if (!mac) return;
+    
+    Serial.printf("%02X:%02X:%02X:%02X:%02X:%02X",
+                  mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 }
 
 /**
  * Print IP address
  */
 void print_ip(uint8_t *ip) {
-    if (ip == NULL) {
-        ESP_LOGD(TAG, "NULL");
-        return;
-    }
-    ESP_LOGD(TAG, "%d.%d.%d.%d", ip[0], ip[1], ip[2], ip[3]);
+    if (!ip) return;
+    
+    Serial.printf("%d.%d.%d.%d", ip[0], ip[1], ip[2], ip[3]);
 }
 
 // ============================================================================
@@ -677,137 +694,67 @@ void print_ip(uint8_t *ip) {
 /**
  * Mesh event handler
  */
+#if defined(ARDUINO)
+void mesh_event_handler(mesh_event_t event) {
+    // Arduino framework - simplified event handling
+    switch(event.id) {
+        case MESH_EVENT_ROOT_GOT_IP:
+            ESP_LOGI(TAG, "Mesh root got IP");
+            break;
+        case MESH_EVENT_ROOT_LOST_IP:
+            ESP_LOGW(TAG, "Mesh root lost IP");
+            break;
+        case MESH_EVENT_NO_PARENT:
+            ESP_LOGW(TAG, "No parent found");
+            break;
+        case MESH_EVENT_PARENT_CONNECTED:
+            ESP_LOGI(TAG, "Parent connected");
+            break;
+        case MESH_EVENT_PARENT_DISCONNECTED:
+            ESP_LOGW(TAG, "Parent disconnected");
+            break;
+        case MESH_EVENT_LAYER_CHANGE:
+            ESP_LOGI(TAG, "Layer changed");
+            break;
+        case MESH_EVENT_CHILD_CONNECTED:
+            ESP_LOGI(TAG, "Child connected");
+            break;
+        case MESH_EVENT_CHILD_DISCONNECTED:
+            ESP_LOGI(TAG, "Child disconnected");
+            break;
+        default:
+            ESP_LOGD(TAG, "Unhandled mesh event: %d", event.id);
+            break;
+    }
+}
+#else
 esp_err_t mesh_event_handler(mesh_event_t event) {
-    switch (event.id) {
-        case MESH_EVENT_STARTED: {
-            ESP_LOGI(TAG, "Mesh started");
-            mesh_initialized = true;
-            set_node_state(NODE_STATE_ACTIVE);
+    // ESP-IDF framework - full event handling
+    switch(event.id) {
+        case MESH_EVENT_ROOT_GOT_IP:
+            ESP_LOGI(TAG, "Mesh root got IP");
             break;
-        }
-        case MESH_EVENT_STOPPED: {
-            ESP_LOGI(TAG, "Mesh stopped");
-            mesh_initialized = false;
-            set_node_state(NODE_STATE_IDLE);
+        case MESH_EVENT_ROOT_LOST_IP:
+            ESP_LOGW(TAG, "Mesh root lost IP");
             break;
-        }
-        case MESH_EVENT_CHILD_CONNECTED: {
-            mesh_event_child_connected_t *child = (mesh_event_child_connected_t *)event.data;
-            ESP_LOGI(TAG, "Child connected: ");
-            print_mac(child->mac);
+        case MESH_EVENT_NO_PARENT:
+            ESP_LOGW(TAG, "No parent found");
             break;
-        }
-        case MESH_EVENT_CHILD_DISCONNECTED: {
-            mesh_event_child_disconnected_t *child = (mesh_event_child_disconnected_t *)event.data;
-            ESP_LOGI(TAG, "Child disconnected: ");
-            print_mac(child->mac);
+        case MESH_EVENT_PARENT_CONNECTED:
+            ESP_LOGI(TAG, "Parent connected");
             break;
-        }
-        case MESH_EVENT_ROUTING_TABLE_ADD: {
-            mesh_event_routing_table_change_t *routing = (mesh_event_routing_table_change_t *)event.data;
-            ESP_LOGI(TAG, "Routing table add: ");
-            print_mac(routing->mac);
+        case MESH_EVENT_PARENT_DISCONNECTED:
+            ESP_LOGW(TAG, "Parent disconnected");
             break;
-        }
-        case MESH_EVENT_ROUTING_TABLE_REMOVE: {
-            mesh_event_routing_table_change_t *routing = (mesh_event_routing_table_change_t *)event.data;
-            ESP_LOGI(TAG, "Routing table remove: ");
-            print_mac(routing->mac);
+        case MESH_EVENT_LAYER_CHANGE:
+            ESP_LOGI(TAG, "Layer changed");
             break;
-        }
-        case MESH_EVENT_NO_PARENT_FOUND: {
-            mesh_event_no_parent_found_t *no_parent = (mesh_event_no_parent_found_t *)event.data;
-            ESP_LOGW(TAG, "No parent found, scan count: %d", no_parent->scan_count);
+        case MESH_EVENT_CHILD_CONNECTED:
+            ESP_LOGI(TAG, "Child connected");
             break;
-        }
-        case MESH_EVENT_PARENT_CONNECTED: {
-            mesh_event_connected_t *connected = (mesh_event_connected_t *)event.data;
-            ESP_LOGI(TAG, "Parent connected: ");
-            print_mac(connected->mac);
+        case MESH_EVENT_CHILD_DISCONNECTED:
+            ESP_LOGI(TAG, "Child disconnected");
             break;
-        }
-        case MESH_EVENT_PARENT_DISCONNECTED: {
-            mesh_event_disconnected_t *disconnected = (mesh_event_disconnected_t *)event.data;
-            ESP_LOGI(TAG, "Parent disconnected: ");
-            print_mac(disconnected->mac);
-            break;
-        }
-        case MESH_EVENT_LAYER_CHANGE: {
-            mesh_event_layer_change_t *layer = (mesh_event_layer_change_t *)event.data;
-            ESP_LOGI(TAG, "Layer change: %d", layer->new_layer);
-            break;
-        }
-        case MESH_EVENT_ROOT_ADDRESS: {
-            mesh_event_root_address_t *root = (mesh_event_root_address_t *)event.data;
-            ESP_LOGI(TAG, "Root address: ");
-            print_mac(root->addr);
-            break;
-        }
-        case MESH_EVENT_VOTE_STARTED: {
-            mesh_event_vote_started_t *vote = (mesh_event_vote_started_t *)event.data;
-            ESP_LOGI(TAG, "Vote started, attempts: %d", vote->attempts);
-            break;
-        }
-        case MESH_EVENT_VOTE_STOPPED: {
-            ESP_LOGI(TAG, "Vote stopped");
-            break;
-        }
-        case MESH_EVENT_ROOT_SWITCH_REQ: {
-            mesh_event_root_switch_req_t *switch_req = (mesh_event_root_switch_req_t *)event.data;
-            ESP_LOGI(TAG, "Root switch request: ");
-            print_mac(switch_req->candidate_mac);
-            break;
-        }
-        case MESH_EVENT_ROOT_SWITCH_ACK: {
-            mesh_event_root_switch_ack_t *switch_ack = (mesh_event_root_switch_ack_t *)event.data;
-            ESP_LOGI(TAG, "Root switch ack: ");
-            print_mac(switch_ack->new_root_mac);
-            break;
-        }
-        case MESH_EVENT_TODS_STATE: {
-            mesh_event_toDS_state_t *toDS = (mesh_event_toDS_state_t *)event.data;
-            ESP_LOGI(TAG, "ToDS state: %d", toDS->toDS);
-            break;
-        }
-        case MESH_EVENT_ROOT_FIXED: {
-            mesh_event_root_fixed_t *fixed = (mesh_event_root_fixed_t *)event.data;
-            ESP_LOGI(TAG, "Root fixed: %d", fixed->is_fixed);
-            break;
-        }
-        case MESH_EVENT_ROOT_ASKED_YIELD: {
-            ESP_LOGI(TAG, "Root asked to yield");
-            break;
-        }
-        case MESH_EVENT_CHANNEL_SWITCH: {
-            mesh_event_channel_switch_t *channel = (mesh_event_channel_switch_t *)event.data;
-            ESP_LOGI(TAG, "Channel switch to: %d", channel->new_channel);
-            break;
-        }
-        case MESH_EVENT_SCAN_DONE: {
-            mesh_event_scan_done_t *scan = (mesh_event_scan_done_t *)event.data;
-            ESP_LOGI(TAG, "Scan done, number: %d", scan->number);
-            break;
-        }
-        case MESH_EVENT_NETWORK_STATE: {
-            mesh_event_network_state_t *network = (mesh_event_network_state_t *)event.data;
-            ESP_LOGI(TAG, "Network state: %d", network->is_connected);
-            break;
-        }
-        case MESH_EVENT_STOP_RECONNECTION: {
-            ESP_LOGI(TAG, "Stop reconnection");
-            break;
-        }
-        case MESH_EVENT_FIND_NETWORK: {
-            mesh_event_find_network_t *find = (mesh_event_find_network_t *)event.data;
-            ESP_LOGI(TAG, "Find network: %d", find->new_network);
-            break;
-        }
-        case MESH_EVENT_ROUTER_SWITCH: {
-            mesh_event_router_switch_t *router = (mesh_event_router_switch_t *)event.data;
-            ESP_LOGI(TAG, "Router switch: ");
-            print_mac(router->new_router.mac);
-            break;
-        }
         default:
             ESP_LOGD(TAG, "Unhandled mesh event: %d", event.id);
             break;
@@ -815,145 +762,64 @@ esp_err_t mesh_event_handler(mesh_event_t event) {
     
     return ESP_OK;
 }
+#endif
 
 /**
  * WiFi event handler
  */
 void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data) {
+    #if defined(ARDUINO)
+    // Arduino framework - simplified event handling
     if (event_base == WIFI_EVENT) {
-        switch (event_id) {
-            case WIFI_EVENT_WIFI_READY:
-                ESP_LOGI(TAG, "WiFi ready");
-                break;
-            case WIFI_EVENT_SCAN_DONE:
-                ESP_LOGI(TAG, "WiFi scan done");
-                break;
+        switch(event_id) {
             case WIFI_EVENT_STA_START:
-                ESP_LOGI(TAG, "STA start");
-                break;
-            case WIFI_EVENT_STA_STOP:
-                ESP_LOGI(TAG, "STA stop");
+                ESP_LOGI(TAG, "WiFi STA started");
                 break;
             case WIFI_EVENT_STA_CONNECTED:
-                ESP_LOGI(TAG, "STA connected");
+                ESP_LOGI(TAG, "WiFi connected");
                 break;
             case WIFI_EVENT_STA_DISCONNECTED:
-                ESP_LOGI(TAG, "STA disconnected");
-                break;
-            case WIFI_EVENT_STA_AUTHMODE_CHANGE:
-                ESP_LOGI(TAG, "STA auth mode change");
+                ESP_LOGW(TAG, "WiFi disconnected");
                 break;
             case WIFI_EVENT_AP_START:
-                ESP_LOGI(TAG, "AP start");
+                ESP_LOGI(TAG, "WiFi AP started");
                 break;
-            case WIFI_EVENT_AP_STOP:
-                ESP_LOGI(TAG, "AP stop");
+            default:
+                ESP_LOGD(TAG, "Unhandled WiFi event: %d", event_id);
                 break;
-            case WIFI_EVENT_AP_STACONNECTED:
-                ESP_LOGI(TAG, "AP STA connected");
+        }
+    }
+    #else
+    // ESP-IDF framework - full event handling
+    if (event_base == WIFI_EVENT) {
+        switch(event_id) {
+            case WIFI_EVENT_STA_START:
+                ESP_LOGI(TAG, "WiFi STA started");
                 break;
-            case WIFI_EVENT_AP_STADISCONNECTED:
-                ESP_LOGI(TAG, "AP STA disconnected");
+            case WIFI_EVENT_STA_CONNECTED:
+                ESP_LOGI(TAG, "WiFi connected");
+                break;
+            case WIFI_EVENT_STA_DISCONNECTED:
+                ESP_LOGW(TAG, "WiFi disconnected");
+                break;
+            case WIFI_EVENT_AP_START:
+                ESP_LOGI(TAG, "WiFi AP started");
                 break;
             default:
                 ESP_LOGD(TAG, "Unhandled WiFi event: %d", event_id);
                 break;
         }
     } else if (event_base == IP_EVENT) {
-        switch (event_id) {
+        switch(event_id) {
             case IP_EVENT_STA_GOT_IP:
                 ESP_LOGI(TAG, "Got IP address");
-                break;
-            case IP_EVENT_STA_LOST_IP:
-                ESP_LOGI(TAG, "Lost IP address");
-                break;
-            case IP_EVENT_AP_STAIPASSIGNED:
-                ESP_LOGI(TAG, "AP assigned IP to STA");
                 break;
             default:
                 ESP_LOGD(TAG, "Unhandled IP event: %d", event_id);
                 break;
         }
     } else if (event_base == MESH_EVENT) {
-        mesh_event_t event;
-        event.id = event_id;
-        event.data = event_data;
-        mesh_event_handler(event);
+        mesh_event_handler(*(mesh_event_t*)event_data);
     }
-}
-
-// ============================================================================
-// Timer Callbacks
-// ============================================================================
-
-/**
- * State update timer callback
- */
-void state_update_timer_callback(void *arg) {
-    update_state();
-}
-
-/**
- * Neighbor cleanup timer callback
- */
-void neighbor_cleanup_timer_callback(void *arg) {
-    cleanup_inactive_neighbors();
-}
-
-// ============================================================================
-// Initialization Function (called from main)
-// ============================================================================
-
-/**
- * Initialize all mesh node components
- */
-void mesh_node_init(void) {
-    ESP_LOGI(TAG, "Initializing mesh node");
-    
-    // Initialize neighbor list
-    init_neighbor_list();
-    
-    // Initialize WiFi
-    init_wifi();
-    
-    // Initialize mesh
-    init_mesh();
-    
-    // Initialize UDP
-    init_udp();
-    
-    // Initialize beacon monitoring
-    init_beacon_monitoring();
-    
-    // Initialize state manager
-    init_state_manager();
-    
-    // Initialize TX power
-    init_tx_power();
-    
-    // Initialize state
-    init_state();
-    
-    // Create timers
-    esp_timer_create_args_t state_timer_args = {
-        .callback = state_update_timer_callback,
-        .arg = NULL,
-        .dispatch_method = ESP_TIMER_TASK,
-        .name = "state_update"
-    };
-    esp_timer_create(&state_timer_args, &state_update_timer);
-    
-    esp_timer_create_args_t cleanup_timer_args = {
-        .callback = neighbor_cleanup_timer_callback,
-        .arg = NULL,
-        .dispatch_method = ESP_TIMER_TASK,
-        .name = "neighbor_cleanup"
-    };
-    esp_timer_create(&cleanup_timer_args, &neighbor_cleanup_timer);
-    
-    // Start timers
-    esp_timer_start_periodic(state_update_timer, STATE_UPDATE_INTERVAL * 1000); // Convert to microseconds
-    esp_timer_start_periodic(neighbor_cleanup_timer, NEIGHBOR_TIMEOUT_MS * 1000);
-    
-    ESP_LOGI(TAG, "Mesh node initialized successfully");
+    #endif
 }
