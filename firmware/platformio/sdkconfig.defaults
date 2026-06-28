@@ -1,0 +1,67 @@
+# ESP-IDF SDK Configuration for ESP-WiFi-Mesh on Seeed XIAO ESP32-C3
+# This file provides default configuration values for PlatformIO to auto-generate sdkconfig
+
+# ============================================================================
+# WiFi Configuration
+# ============================================================================
+CONFIG_ESP_WIFI_SOFTAP_SUPPORT=y
+CONFIG_ESP_WIFI_MESH_SUPPORT=y
+CONFIG_ESP_WIFI_ESPMAC=y
+
+# ============================================================================
+# ESP-WiFi-Mesh Configuration
+# ============================================================================
+CONFIG_MESH_ESP_WIFI_MESH=y
+CONFIG_MESH_MAX_HOPS=10
+CONFIG_MESH_MAX_LAYER=10
+CONFIG_MESH_VOTE_PERCENT=1
+CONFIG_MESH_MAX_TTL=10
+CONFIG_MESH_MAX_NEIGHBORS=50
+CONFIG_MESH_MAX_KNOWN_PEERS=200
+CONFIG_MESH_RSSI_THRESHOLD=-80
+CONFIG_MESH_NEIGHBOR_TIMEOUT_MS=5000
+CONFIG_MESH_AP_IDLE_INTERVAL_MS=10000
+CONFIG_MESH_AP_SCAN_INTERVAL_MS=30000
+CONFIG_MESH_AP_MAX_AGE_MS=60000
+
+# ============================================================================
+# UDP Configuration
+# ============================================================================
+CONFIG_MESH_UDP_PORT=1234
+
+# ============================================================================
+# TX Power Configuration
+# ============================================================================
+CONFIG_ESP_WIFI_TX_POWER.Control=y
+CONFIG_ESP_WIFI_MAX_TX_POWER=20
+CONFIG_ESP_WIFI_MIN_TX_POWER=0
+
+# ============================================================================
+# Network Configuration
+# ============================================================================
+CONFIG_LWIP_IPV4=y
+CONFIG_LWIP_DHCP=y
+
+# ============================================================================
+# Logging Configuration
+# ============================================================================
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y
+CONFIG_MESH_DEBUG=y
+
+# ============================================================================
+# Hardware Configuration for ESP32-C3
+# ============================================================================
+CONFIG_ESP32_WIFI_SOFTAP_SUPPORT=y
+CONFIG_ESP32_WIFI_NVS_ENABLED=y
+
+# ============================================================================
+# Memory Configuration
+# ============================================================================
+CONFIG_SPIRAM_ICACHE=y
+CONFIG_SPIRAM_SPIRAM_MODE=y
+
+# ============================================================================
+# Component Configuration
+# ============================================================================
+CONFIG_FREERTOS_UNICORE=y
+CONFIG_FREERTOS_USE_TICKLESS_IDLE=y
