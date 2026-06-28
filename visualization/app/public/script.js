@@ -57,6 +57,7 @@ let svg, simulation, nodeElements, linkElements, labelElements, rssiElements;
 let ws;
 let isPaused = false;
 let isConnected = false;
+let mqttConnected = false;
 let colorScheme = 'rssi';
 let showLabels = true;
 let showRssi = true;
@@ -371,6 +372,9 @@ function connectWebSocket() {
             isConnected = true;
             updateConnectionStatus(true);
             console.log('WebSocket connected');
+            
+            // Check MQTT status via API
+            checkMqttStatus();
         };
         
         ws.onmessage = (event) => {
@@ -427,7 +431,7 @@ function connectWebSocket() {
 }
 
 /**
- * Update connection status indicator
+ * Update WebSocket connection status indicator
  */
 function updateConnectionStatus(connected) {
     const statusEl = document.querySelector('.connection-status');
@@ -437,6 +441,47 @@ function updateConnectionStatus(connected) {
         statusEl.classList.add('connected');
     } else {
         statusEl.classList.remove('connected');
+    }
+}
+
+/**
+ * Update MQTT connection status indicator
+ */
+function updateMqttConnectionStatus(connected) {
+    mqttConnected = connected;
+    const mqttStatusEl = document.querySelector('.mqtt-status');
+    if (!mqttStatusEl) return;
+    
+    if (connected) {
+        mqttStatusEl.classList.add('connected');
+        mqttStatusEl.title = 'MQTT: Connected';
+    } else {
+        mqttStatusEl.classList.remove('connected');
+        mqttStatusEl.title = 'MQTT: Disconnected';
+    }
+}
+
+/**
+ * Check MQTT status via API
+ */
+function checkMqttStatus() {
+    if (!isConnected) return;
+    
+    try {
+        fetch('/api/mqtt')
+            .then(response => response.json())
+            .then(data => {
+                if (data.connected !== undefined) {
+                    updateMqttConnectionStatus(data.connected);
+                }
+            })
+            .catch(error => {
+                console.error('Failed to check MQTT status:', error);
+                updateMqttConnectionStatus(false);
+            });
+    } catch (error) {
+        console.error('Failed to check MQTT status:', error);
+        updateMqttConnectionStatus(false);
     }
 }
 
@@ -672,10 +717,19 @@ function init() {
     // Initial resize
     onWindowResize();
     
-    // Create connection status indicator
-    const statusEl = document.createElement('div');
-    statusEl.className = 'connection-status';
-    document.body.appendChild(statusEl);
+    // Create connection status indicators
+    const wsStatusEl = document.createElement('div');
+    wsStatusEl.className = 'connection-status';
+    wsStatusEl.title = 'WebSocket: Disconnected';
+    document.body.appendChild(wsStatusEl);
+    
+    const mqttStatusEl = document.createElement('div');
+    mqttStatusEl.className = 'mqtt-status';
+    mqttStatusEl.title = 'MQTT: Disconnected';
+    document.body.appendChild(mqttStatusEl);
+    
+    // Check MQTT status periodically
+    setInterval(checkMqttStatus, 10000); // Check every 10 seconds
     
     console.log('Mesh visualization initialized');
 }

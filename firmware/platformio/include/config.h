@@ -55,7 +55,7 @@ typedef struct {
 #define UDP_PORT 1234
 
 // Visualization server configuration
-#define VISUALIZATION_IP "10.64.5.196"
+#define VISUALIZATION_IP "10.65.5.196"
 #define VISUALIZATION_PORT 1234
 
 // ============================================================================
@@ -63,7 +63,7 @@ typedef struct {
 // ============================================================================
 
 #define ENABLE_MQTT_VISUALIZATION 1
-#define MQTT_BROKER_IP "10.64.5.196"
+#define MQTT_BROKER_IP "10.65.5.196"
 #define MQTT_BROKER_PORT 1883
 #define MQTT_CLIENT_ID "esp32_mesh_node"
 #define MQTT_TOPOLOGY_TOPIC "mesh/topology"
@@ -83,7 +83,7 @@ typedef struct {
 // IP Configuration
 // ============================================================================
 
-#define IP_PREFIX "10.64."
+#define IP_PREFIX "10.65."
 #define IP_SUBNET_MASK "255.240.0.0"
 
 // ============================================================================

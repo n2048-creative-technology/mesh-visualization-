@@ -1,13 +1,14 @@
 /**
  * Mesh Visualization Server
- * Node.js backend for UDP listener and WebSocket bridge
- * Receives binary UDP messages from ESP32 nodes and broadcasts to web clients
+ * Node.js backend for UDP listener, MQTT client and WebSocket bridge
+ * Receives binary UDP messages and MQTT messages from ESP32 nodes and broadcasts to web clients
  */
 
 const dgram = require('dgram');
 const WebSocket = require('ws');
 const express = require('express');
 const path = require('path');
+const mqtt = require('mqtt');
 
 // ============================================================================
 // Configuration
@@ -16,6 +17,29 @@ const path = require('path');
 const UDP_PORT = 1234;
 const HTTP_PORT = 3000;
 const WS_PORT = 3000;
+
+// ============================================================================
+// MQTT Configuration
+// ============================================================================
+
+// Read MQTT broker URL from environment or use default
+// Note: To work with the firmware, this should match the IP in config.h (10.64.5.196)
+// But your current machine IP is 10.65.5.196. Use environment variable to override:
+// MQTT_BROKER_URL=mqtt://10.65.5.196:1883 node server.js
+const MQTT_BROKER_URL = process.env.MQTT_BROKER_URL || 'mqtt://localhost:1883';
+const MQTT_TOPOLOGY_TOPIC = process.env.MQTT_TOPOLOGY_TOPIC || 'mesh/topology';
+const MQTT_STATE_TOPIC = process.env.MQTT_STATE_TOPIC || 'mesh/state';
+const MQTT_CLIENT_ID = process.env.MQTT_CLIENT_ID || 'mesh_visualization_server';
+
+// Log MQTT configuration at startup
+console.log('MQTT Configuration:');
+console.log('  Broker URL:', MQTT_BROKER_URL);
+console.log('  Topology Topic:', MQTT_TOPOLOGY_TOPIC);
+console.log('  State Topic:', MQTT_STATE_TOPIC);
+
+// MQTT Client
+let mqttClient = null;
+let mqttConnected = false;
 
 // ============================================================================
 // Data Structures
@@ -160,6 +184,247 @@ function calculateChecksum(buffer) {
 }
 
 // ============================================================================
+// MQTT Message Parser
+// ============================================================================
+
+/**
+ * Convert MQTT topology message to node update format
+ * MQTT topology message format:
+ * {
+ *   "node_mac": "xx:xx:xx:xx:xx:xx",
+ *   "node_state": 0-3,
+ *   "layer": number,
+ *   "routing_table_size": number,
+ *   "neighbors": [
+ *     {"mac": "xx:xx:xx:xx:xx:xx", "rssi": -50, "last_seen": timestamp}
+ *   ],
+ *   "neighbor_count": number
+ * }
+ */
+function convertMqttTopologyToNode(topologyMsg) {
+    const node = {
+        version: PROTOCOL_VERSION,
+        msgType: MSG_TYPE_STATE_UPDATE,
+        mac: topologyMsg.node_mac,
+        state: topologyMsg.node_state || 1, // default to idle
+        color: { r: 0, g: 255, b: 0 }, // default green
+        temperature: 0, // will be updated from state message
+        mmwavePresence: false,
+        mmwaveDistance: 0,
+        timestamp: Date.now() / 1000, // convert to seconds
+        neighbors: [],
+        receivedAt: Date.now()
+    };
+
+    // Convert neighbors from MQTT format to internal format
+    if (topologyMsg.neighbors && Array.isArray(topologyMsg.neighbors)) {
+        for (const neighbor of topologyMsg.neighbors) {
+            if (neighbor.mac && neighbor.rssi !== undefined) {
+                node.neighbors.push({
+                    mac: neighbor.mac,
+                    rssi: neighbor.rssi
+                });
+            }
+        }
+    }
+
+    return node;
+}
+
+/**
+ * Convert MQTT state message to node update format
+ * MQTT state message format:
+ * {
+ *   "mac": "xx:xx:xx:xx:xx:xx",
+ *   "state": 0-3,
+ *   "temperature": 250 (×10), 
+ *   "mmwave_presence": 0 or 1,
+ *   "mmwave_distance": 1500,
+ *   "timestamp": 123456789,
+ *   "color": [255, 0, 0]
+ * }
+ */
+function convertMqttStateToNode(stateMsg) {
+    return {
+        version: PROTOCOL_VERSION,
+        msgType: MSG_TYPE_STATE_UPDATE,
+        mac: stateMsg.mac,
+        state: stateMsg.state || 1,
+        color: {
+            r: stateMsg.color && Array.isArray(stateMsg.color) && stateMsg.color[0] !== undefined ? stateMsg.color[0] : 0,
+            g: stateMsg.color && Array.isArray(stateMsg.color) && stateMsg.color[1] !== undefined ? stateMsg.color[1] : 255,
+            b: stateMsg.color && Array.isArray(stateMsg.color) && stateMsg.color[2] !== undefined ? stateMsg.color[2] : 0
+        },
+        temperature: (stateMsg.temperature !== undefined ? stateMsg.temperature : 0) / 10.0,
+        mmwavePresence: (stateMsg.mmwave_presence || 0) !== 0,
+        mmwaveDistance: stateMsg.mmwave_distance || 0,
+        timestamp: stateMsg.timestamp || Math.floor(Date.now() / 1000),
+        neighbors: [], // will be populated from topology message
+        receivedAt: Date.now()
+    };
+}
+
+// ============================================================================
+// MQTT Client Setup
+// ============================================================================
+
+/**
+ * Connect to MQTT broker
+ */
+function connectMQTT() {
+    try {
+        console.log(`Connecting to MQTT broker at ${MQTT_BROKER_URL}...`);
+        
+        mqttClient = mqtt.connect(MQTT_BROKER_URL, {
+            clientId: MQTT_CLIENT_ID,
+            clean: true,
+            reconnectPeriod: 5000,
+            connectTimeout: 10000
+        });
+
+        mqttClient.on('connect', () => {
+            mqttConnected = true;
+            console.log('MQTT connected');
+            
+            // Subscribe to MQTT topics
+            mqttClient.subscribe(MQTT_TOPOLOGY_TOPIC, { qos: 0 }, (err) => {
+                if (err) {
+                    console.error('Failed to subscribe to topology topic:', err);
+                } else {
+                    console.log(`Subscribed to ${MQTT_TOPOLOGY_TOPIC}`);
+                }
+            });
+
+            mqttClient.subscribe(MQTT_STATE_TOPIC, { qos: 0 }, (err) => {
+                if (err) {
+                    console.error('Failed to subscribe to state topic:', err);
+                } else {
+                    console.log(`Subscribed to ${MQTT_STATE_TOPIC}`);
+                }
+            });
+        });
+
+        mqttClient.on('message', (topic, message) => {
+            try {
+                const payload = JSON.parse(message.toString());
+                handleMqttMessage(topic, payload);
+            } catch (error) {
+                console.error('Error parsing MQTT message:', error);
+            }
+        });
+
+        mqttClient.on('error', (err) => {
+            mqttConnected = false;
+            console.error('MQTT error:', err);
+        });
+
+        mqttClient.on('close', () => {
+            mqttConnected = false;
+            console.log('MQTT connection closed');
+            // Attempt to reconnect
+            setTimeout(connectMQTT, 5000);
+        });
+
+        mqttClient.on('offline', () => {
+            mqttConnected = false;
+            console.log('MQTT client offline');
+        });
+
+        mqttClient.on('reconnect', () => {
+            console.log('MQTT reconnecting...');
+        });
+
+    } catch (error) {
+        console.error('Failed to initialize MQTT client:', error);
+        mqttConnected = false;
+    }
+}
+
+/**
+ * Handle incoming MQTT message
+ */
+function handleMqttMessage(topic, payload) {
+    messageCount++;
+    lastMessageTime = Date.now();
+
+    let node = null;
+
+    switch (topic) {
+        case MQTT_TOPOLOGY_TOPIC:
+            // Handle topology message - this contains neighbor information
+            node = convertMqttTopologyToNode(payload);
+            break;
+
+        case MQTT_STATE_TOPIC:
+            // Handle state message - this contains node sensor data
+            node = convertMqttStateToNode(payload);
+            break;
+
+        default:
+            console.log(`Received MQTT message on unknown topic: ${topic}`);
+            return;
+    }
+
+    if (node === null || !node.mac) {
+        console.warn('Failed to parse MQTT message:', payload);
+        return;
+    }
+
+    // Update node data
+    const existingNode = nodes[node.mac];
+    
+    if (existingNode) {
+        // Merge the new data with existing node
+        if (topic === MQTT_TOPOLOGY_TOPIC) {
+            // Update neighbors from topology message
+            existingNode.neighbors = node.neighbors;
+            existingNode.state = node.state;
+        } else if (topic === MQTT_STATE_TOPIC) {
+            // Update sensor data from state message
+            existingNode.state = node.state;
+            existingNode.color = node.color;
+            existingNode.temperature = node.temperature;
+            existingNode.mmwavePresence = node.mmwavePresence;
+            existingNode.mmwaveDistance = node.mmwaveDistance;
+            existingNode.timestamp = node.timestamp;
+        }
+        existingNode.receivedAt = Date.now();
+        node = existingNode;
+    } else {
+        // Create new node
+        nodes[node.mac] = node;
+    }
+
+    // Broadcast to all WebSocket clients
+    wss.clients.forEach(client => {
+        if (client.readyState === WebSocket.OPEN) {
+            client.send(JSON.stringify({ 
+                type: 'node_update', 
+                data: node 
+            }));
+        }
+    });
+
+    console.log(`MQTT: Received ${topic} from ${node.mac} (Neighbors: ${node.neighbors.length}, Temp: ${node.temperature}°C)`);
+}
+
+/**
+ * Disconnect MQTT client
+ */
+function disconnectMQTT() {
+    if (mqttClient) {
+        try {
+            mqttClient.end(true);
+            mqttClient = null;
+            mqttConnected = false;
+            console.log('MQTT client disconnected');
+        } catch (error) {
+            console.error('Error disconnecting MQTT client:', error);
+        }
+    }
+}
+
+// ============================================================================
 // Server Setup
 // ============================================================================
 
@@ -200,11 +465,25 @@ app.get('/api/stats', (req, res) => {
     });
 });
 
+// MQTT status endpoint
+app.get('/api/mqtt', (req, res) => {
+    res.json({
+        connected: mqttConnected,
+        broker: MQTT_BROKER_URL,
+        topologyTopic: MQTT_TOPOLOGY_TOPIC,
+        stateTopic: MQTT_STATE_TOPIC,
+        clientId: MQTT_CLIENT_ID
+    });
+});
+
 // WebSocket server
 const wss = new WebSocket.Server({ server });
 
 // UDP socket
 const udpSocket = dgram.createSocket('udp4');
+
+// Start MQTT client
+connectMQTT();
 
 // ============================================================================
 // UDP Message Handler
@@ -283,6 +562,7 @@ server.listen(HTTP_PORT, () => {
 // Handle process termination
 process.on('SIGINT', () => {
     console.log('\nShutting down server...');
+    disconnectMQTT();
     udpSocket.close();
     wss.close();
     server.close();
@@ -319,4 +599,5 @@ setInterval(() => {
 console.log('='.repeat(50));
 console.log('  Mesh Visualization Server');
 console.log('  Adaptive ESP32 Mesh Network');
+console.log('  Supports: UDP (port ' + UDP_PORT + ') + MQTT (' + MQTT_BROKER_URL + ')');
 console.log('='.repeat(50));
