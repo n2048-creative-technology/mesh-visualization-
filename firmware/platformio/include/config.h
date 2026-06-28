@@ -45,8 +45,8 @@ typedef struct {
 #define MESH_VOTE_PERCENT 1
 
 // Mesh network credentials
-#define MESH_ROUTER_SSID "mesh_network"
-#define MESH_ROUTER_PASS "mesh_password"
+#define MESH_ROUTER_SSID "n2048"
+#define MESH_ROUTER_PASS "16377240"
 
 // ============================================================================
 // UDP Settings
@@ -55,8 +55,20 @@ typedef struct {
 #define UDP_PORT 1234
 
 // Visualization server configuration
-#define VISUALIZATION_IP "10.64.0.196"
+#define VISUALIZATION_IP "10.64.5.196"
 #define VISUALIZATION_PORT 1234
+
+// ============================================================================
+// MQTT Configuration
+// ============================================================================
+
+#define ENABLE_MQTT_VISUALIZATION 1
+#define MQTT_BROKER_IP "10.64.5.196"
+#define MQTT_BROKER_PORT 1883
+#define MQTT_CLIENT_ID "esp32_mesh_node"
+#define MQTT_TOPOLOGY_TOPIC "mesh/topology"
+#define MQTT_STATE_TOPIC "mesh/state"
+#define MQTT_UPDATE_INTERVAL_MS 5000
 
 // ============================================================================
 // TX Power Settings

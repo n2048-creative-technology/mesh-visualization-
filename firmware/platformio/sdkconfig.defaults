@@ -65,3 +65,10 @@ CONFIG_SPIRAM_SPIRAM_MODE=y
 # ============================================================================
 CONFIG_FREERTOS_UNICORE=y
 CONFIG_FREERTOS_USE_TICKLESS_IDLE=y
+
+# ============================================================================
+# MQTT Configuration
+# ============================================================================
+CONFIG_MQTT_CLIENT=y
+CONFIG_MQTT_TRANSPORT_WIFI=y
+CONFIG_MQTT_PROTOCOL_311=y

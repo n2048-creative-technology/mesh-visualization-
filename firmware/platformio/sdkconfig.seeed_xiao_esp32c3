@@ -2695,7 +2695,6 @@ CONFIG_MBEDTLS_FS_IO=y
 #
 # ESP-MQTT Configurations
 #
-# default:
 CONFIG_MQTT_PROTOCOL_311=y
 # default:
 # CONFIG_MQTT_PROTOCOL_5 is not set

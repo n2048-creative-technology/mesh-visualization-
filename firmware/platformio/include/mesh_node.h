@@ -37,6 +37,7 @@ void update_neighbor_list(uint8_t *mac, int8_t rssi);
 void cleanup_inactive_neighbors(void);
 neighbor_info_t* get_neighbor_by_mac(uint8_t *mac);
 int get_neighbor_count(void);
+void trigger_neighbor_discovery(void);
 void init_state(void);
 void update_state(void);
 void set_node_state(uint8_t state);
