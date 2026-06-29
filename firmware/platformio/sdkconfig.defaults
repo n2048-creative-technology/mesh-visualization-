@@ -72,3 +72,10 @@ CONFIG_FREERTOS_USE_TICKLESS_IDLE=y
 CONFIG_MQTT_CLIENT=y
 CONFIG_MQTT_TRANSPORT_WIFI=y
 CONFIG_MQTT_PROTOCOL_311=y
+
+# ============================================================================
+# Partition Table
+# ============================================================================
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+CONFIG_PARTITION_TABLE_FILENAME="partitions.csv"

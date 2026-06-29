@@ -17,6 +17,15 @@
 #define NODE_STATE_ACTIVE 2
 #define NODE_STATE_ERROR 3
 
+// Emergent cellular automata state, based on n2048-creative-technology/emergent-esp32.
+#define KERNEL_SIZE 9
+#define MAX_ACTIVATIONS 8
+
+typedef struct {
+    uint8_t op;     // 0="<", 1="<=", 2="==", 3=">=", 4=">"
+    float value;
+} activation_rule_t;
+
 // Node state structure
 typedef struct {
     uint8_t state;           // Node state (0=booting, 1=idle, 2=active, 3=error)
@@ -25,10 +34,18 @@ typedef struct {
     uint8_t mmwave_presence; // 0 or 1
     uint32_t mmwave_distance; // Distance in mm
     uint32_t timestamp;      // Unix timestamp
+    uint8_t value;           // Binary CA value used for LED output
+    uint32_t kernel_sequence;
+    uint32_t value_sequence;
+    uint32_t activation_sequence;
+    float kernel[KERNEL_SIZE]; // n0..n7 + self
+    activation_rule_t activations[MAX_ACTIVATIONS];
+    uint8_t activation_count;
+    float activation_sum;
 } node_state_t;
 
 // ============================================================================
-// Platform Configuration - Seeed XIAO ESP32-C3 Only
+// Platform Configuration
 // ============================================================================
 
 #define PLATFORM_NAME "Seeed XIAO ESP32-C3"
@@ -37,37 +54,87 @@ typedef struct {
 // WiFi and Mesh Settings
 // ============================================================================
 
-// ESP32-C3 uses 2.4 GHz only
+// ESP32-C3 uses 2.4 GHz only. Channel 0 lets ESP-WiFi-Mesh scan for the router.
+#ifndef NETWORK_ENV_HOME
 #define WIFI_CHANNEL 6
+#else
+#define WIFI_CHANNEL 0
+#endif
 
 // Mesh configuration
 #define MESH_MAX_HOPS 10
 #define MESH_VOTE_PERCENT 1
+#define MESH_AP_CONNECTIONS 6
+#define MESH_NON_MESH_AP_CONNECTIONS 0
+#define MESH_AP_PASS "meshnode"
 
 // Mesh network credentials
+#ifndef NETWORK_ENV_HOME
+#ifndef MESH_ROUTER_SSID
 #define MESH_ROUTER_SSID "n2048"
+#endif
+
+#ifndef MESH_ROUTER_PASS
 #define MESH_ROUTER_PASS "16377240"
+#endif
+#else
+#ifndef MESH_ROUTER_SSID
+#define MESH_ROUTER_SSID "octopuslab"
+#endif
+
+#ifndef MESH_ROUTER_PASS
+#define MESH_ROUTER_PASS "the-8-lab"
+#endif
+#endif
 
 // ============================================================================
 // UDP Settings
 // ============================================================================
 
 #define UDP_PORT 1234
+#ifndef TCP_PORT
+#define TCP_PORT 1235
+#endif
 
-// Visualization server configuration
+// Visualization server configuration - set via build flags in platformio.ini
+#ifndef NETWORK_ENV_HOME
+#ifndef VISUALIZATION_IP
 #define VISUALIZATION_IP "10.65.5.196"
+#endif
+#else
+#ifndef VISUALIZATION_IP
+#define VISUALIZATION_IP "192.168.178.169"
+#endif
+#endif
+#ifndef VISUALIZATION_PORT
 #define VISUALIZATION_PORT 1234
+#endif
 
 // ============================================================================
 // MQTT Configuration
 // ============================================================================
 
+// MQTT Configuration - can be disabled if only UDP is used
+#ifndef ENABLE_MQTT_VISUALIZATION
 #define ENABLE_MQTT_VISUALIZATION 1
+#endif
+
+#ifndef NETWORK_ENV_HOME
+#ifndef MQTT_BROKER_IP
 #define MQTT_BROKER_IP "10.65.5.196"
+#endif
+#else
+#ifndef MQTT_BROKER_IP
+#define MQTT_BROKER_IP "192.168.178.169"
+#endif
+#endif
 #define MQTT_BROKER_PORT 1883
+#ifndef MQTT_CLIENT_ID
 #define MQTT_CLIENT_ID "esp32_mesh_node"
+#endif
 #define MQTT_TOPOLOGY_TOPIC "mesh/topology"
 #define MQTT_STATE_TOPIC "mesh/state"
+#define MQTT_COMMAND_TOPIC "mesh/commands"
 #define MQTT_UPDATE_INTERVAL_MS 5000
 
 // ============================================================================
@@ -83,15 +150,29 @@ typedef struct {
 // IP Configuration
 // ============================================================================
 
+// IP Configuration - set via build flags in platformio.ini
+#ifndef NETWORK_ENV_HOME
 #define IP_PREFIX "10.65."
 #define IP_SUBNET_MASK "255.240.0.0"
+#else
+#define IP_PREFIX "192.168."
+#define IP_SUBNET_MASK "255.255.240.0"
+#endif
 
 // ============================================================================
 // Neighbor Settings
 // ============================================================================
 
-#define MAX_NEIGHBORS 50
-#define RSSI_THRESHOLD 3
+// Neighbor Settings - can be overridden via build flags
+#ifndef MAX_NEIGHBORS
+#define MAX_NEIGHBORS 8
+#endif
+#ifndef RSSI_THRESHOLD
+#define RSSI_THRESHOLD -80
+#endif
+#ifndef ENABLE_WIFI_NEIGHBOR_SCAN
+#define ENABLE_WIFI_NEIGHBOR_SCAN 0
+#endif
 #define NEIGHBOR_TIMEOUT_MS 5000
 #define BEACON_SCAN_INTERVAL 100
 
@@ -109,6 +190,7 @@ typedef struct {
 #define NUM_LEDS 1
 #define DATA_PIN 10
 #define TRANSITION_SPEED 0.002
+#define LED_STRIP_RMT_RES_HZ 10000000
 #define TEMP_READ_INTERVAL_MS 5000
 
 // ============================================================================
@@ -116,14 +198,14 @@ typedef struct {
 // ESP32-C3 GPIO definitions
 // ============================================================================
 
-// LED PWM pins (adjust based on your hardware)
+// Sensor pins
+#define MMWAVE_PRESENCE_PIN 5
+
+// For ESP32-C3, we use GPIO pins directly
+// LED pins for RGB (if using individual LEDs)
 #define LED_RED_PIN 1
 #define LED_GREEN_PIN 2
 #define LED_BLUE_PIN 3
-
-// Sensor pins
-#define MMWAVE_PRESENCE_PIN 5
-#define TEMPERATURE_PIN 4
 
 // ============================================================================
 // Debug Settings
@@ -155,29 +237,3 @@ typedef struct {
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 #define CLAMP(x, low, high) (((x) > (high)) ? (high) : (((x) < (low)) ? (low) : (x)))
-
-// ============================================================================
-// ESP-IDF Compatibility
-// ============================================================================
-
-// For ESP-IDF, GPIO_NUM_* macros are not needed - use raw numbers
-#define GPIO_NUM_0 0
-#define GPIO_NUM_1 1
-#define GPIO_NUM_2 2
-#define GPIO_NUM_3 3
-#define GPIO_NUM_4 4
-#define GPIO_NUM_5 5
-#define GPIO_NUM_6 6
-#define GPIO_NUM_7 7
-#define GPIO_NUM_8 8
-#define GPIO_NUM_9 9
-#define GPIO_NUM_10 10
-#define GPIO_NUM_11 11
-#define GPIO_NUM_12 12
-#define GPIO_NUM_13 13
-#define GPIO_NUM_14 14
-#define GPIO_NUM_15 15
-#define GPIO_NUM_16 16
-#define GPIO_NUM_17 17
-#define GPIO_NUM_18 18
-#define GPIO_NUM_19 19

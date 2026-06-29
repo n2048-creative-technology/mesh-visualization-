@@ -1,0 +1,6 @@
+# Name,   Type, SubType, Offset,  Size, Flags
+# Note: if you have external flash, please see the note at the end of this file
+nvs,      data, nvs,     0x9000,  0x5000,
+phy_init, data, phy,     0xf000,  0x1000,
+factory,  app,  factory, 0x10000, 0x200000,
+storage,  data, 0x99,    0x210000, 0x1F0000,
