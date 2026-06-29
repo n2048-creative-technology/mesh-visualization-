@@ -169,6 +169,12 @@ function mergeNodeData(current, incoming) {
     return Object.assign(current, incoming, physics);
 }
 
+function getVisibleLabelNodes() {
+    const nodeData = Object.values(nodes);
+    if (!selectedNodeMac) return nodeData;
+    return nodeData.filter(node => node.mac === selectedNodeMac);
+}
+
 // ============================================================================
 // D3.js Setup
 // ============================================================================
@@ -191,6 +197,15 @@ function initVisualization() {
 
     svg.call(zoomBehavior);
     svg.on('dblclick.zoom', null);
+    svg.on('click', event => {
+        if (event.defaultPrevented) return;
+        if (event.target.closest && event.target.closest('.node')) return;
+        if (!selectedNodeMac) return;
+
+        selectedNodeMac = null;
+        nodeCommandStatus = '';
+        updateVisualization();
+    });
     
     // Create force simulation
     simulation = d3.forceSimulation()
@@ -278,7 +293,7 @@ function initVisualization() {
             return;
         }
 
-        const nodeData = Object.values(nodes);
+        const nodeData = getVisibleLabelNodes();
         const detailSelection = detailContainer.selectAll('.node-detail')
             .data(nodeData, d => d.mac);
 
@@ -326,14 +341,14 @@ function initVisualization() {
         }
         
         labelElements = labelContainer.selectAll('.node-label')
-            .data(Object.values(nodes), d => d.mac);
+            .data(getVisibleLabelNodes(), d => d.mac);
         
-        labelElements.enter()
+        labelElements = labelElements.enter()
             .append('text')
             .attr('class', 'node-label')
             .attr('dy', -15)
-            .text(d => shortenMac(d.mac))
-            .merge(labelElements);
+            .merge(labelElements)
+            .text(d => shortenMac(d.mac));
         
         labelElements.exit().remove();
     }
@@ -345,20 +360,20 @@ function initVisualization() {
         }
         
         // Only show RSSI for nodes with neighbors
-        const nodesWithRssi = Object.values(nodes).filter(n => n.neighbors.length > 0);
+        const nodesWithRssi = getVisibleLabelNodes().filter(n => n.neighbors.length > 0);
         
         rssiElements = rssiContainer.selectAll('.node-rssi')
             .data(nodesWithRssi, d => d.mac);
         
-        rssiElements.enter()
+        rssiElements = rssiElements.enter()
             .append('text')
             .attr('class', 'node-rssi')
             .attr('dy', 15)
+            .merge(rssiElements)
             .text(d => {
                 const avgRssi = d.neighbors.reduce((sum, n) => sum + n.rssi, 0) / d.neighbors.length;
                 return formatRssi(Math.round(avgRssi));
-            })
-            .merge(rssiElements);
+            });
         
         rssiElements.exit().remove();
     }

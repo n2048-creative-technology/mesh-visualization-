@@ -13,6 +13,7 @@
 #include "esp_timer.h"
 #include "led_strip.h"
 #include "led_strip_rmt.h"
+#include "nvs.h"
 
 static const char *TAG = "STATE_MANAGER";
 
@@ -27,6 +28,23 @@ static led_strip_handle_t led_strip = NULL;
 
 static char kernel_function[64] = "random";
 static char activation_function[128] = "threshold";
+
+#define STATE_CONFIG_NVS_NAMESPACE "state"
+#define STATE_CONFIG_NVS_KEY "cfg"
+#define STATE_CONFIG_MAGIC 0x4d455348u
+#define STATE_CONFIG_VERSION 1u
+
+typedef struct {
+    uint32_t magic;
+    uint16_t version;
+    uint8_t activation_count;
+    uint8_t reserved;
+    uint32_t kernel_sequence;
+    uint32_t activation_sequence;
+    float kernel[KERNEL_SIZE];
+    activation_rule_t activations[MAX_ACTIVATIONS];
+    char kernel_function[64];
+} persisted_state_config_t;
 
 static const float kKernelConway[KERNEL_SIZE] = {1, 1, 1, 1, 1, 1, 1, 1, 9};
 static const activation_rule_t kActivationsConway[] = {{2, 3.0f}, {2, 11.0f}, {2, 12.0f}};
@@ -100,6 +118,88 @@ static bool load_preset_data(const char *preset_name, const float **kernel,
         return true;
     }
     return false;
+}
+
+static bool save_state_config(void) {
+    persisted_state_config_t config = {};
+    config.magic = STATE_CONFIG_MAGIC;
+    config.version = STATE_CONFIG_VERSION;
+    config.activation_count = node_state.activation_count;
+    config.kernel_sequence = node_state.kernel_sequence;
+    config.activation_sequence = node_state.activation_sequence;
+    memcpy(config.kernel, node_state.kernel, sizeof(config.kernel));
+    memcpy(config.activations, node_state.activations, sizeof(config.activations));
+    strlcpy(config.kernel_function, kernel_function, sizeof(config.kernel_function));
+
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(STATE_CONFIG_NVS_NAMESPACE, NVS_READWRITE, &handle);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to open NVS for config save: %s", esp_err_to_name(err));
+        return false;
+    }
+
+    err = nvs_set_blob(handle, STATE_CONFIG_NVS_KEY, &config, sizeof(config));
+    if (err == ESP_OK) {
+        err = nvs_commit(handle);
+    }
+    nvs_close(handle);
+
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to save config to NVS: %s", esp_err_to_name(err));
+        return false;
+    }
+
+    ESP_LOGI(TAG, "Saved kernel/activation config to NVS kseq=%lu aseq=%lu",
+             (unsigned long)node_state.kernel_sequence,
+             (unsigned long)node_state.activation_sequence);
+    return true;
+}
+
+static bool load_state_config(void) {
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(STATE_CONFIG_NVS_NAMESPACE, NVS_READONLY, &handle);
+    if (err != ESP_OK) {
+        if (err != ESP_ERR_NVS_NOT_FOUND) {
+            ESP_LOGW(TAG, "Failed to open NVS for config load: %s", esp_err_to_name(err));
+        }
+        return false;
+    }
+
+    persisted_state_config_t config = {};
+    size_t size = sizeof(config);
+    err = nvs_get_blob(handle, STATE_CONFIG_NVS_KEY, &config, &size);
+    nvs_close(handle);
+
+    if (err != ESP_OK) {
+        if (err != ESP_ERR_NVS_NOT_FOUND) {
+            ESP_LOGW(TAG, "Failed to load config from NVS: %s", esp_err_to_name(err));
+        }
+        return false;
+    }
+    if (size != sizeof(config) ||
+        config.magic != STATE_CONFIG_MAGIC ||
+        config.version != STATE_CONFIG_VERSION ||
+        config.activation_count > MAX_ACTIVATIONS) {
+        ESP_LOGW(TAG, "Ignoring invalid persisted kernel/activation config");
+        return false;
+    }
+
+    memcpy(node_state.kernel, config.kernel, sizeof(node_state.kernel));
+    memset(node_state.activations, 0, sizeof(node_state.activations));
+    memcpy(node_state.activations, config.activations, sizeof(node_state.activations));
+    node_state.activation_count = config.activation_count;
+    node_state.kernel_sequence = config.kernel_sequence;
+    node_state.activation_sequence = config.activation_sequence;
+    strlcpy(kernel_function, config.kernel_function, sizeof(kernel_function));
+    if (kernel_function[0] == '\0') {
+        strlcpy(kernel_function, "custom", sizeof(kernel_function));
+    }
+    describe_activation_rules();
+
+    ESP_LOGI(TAG, "Loaded persisted kernel/activation config kseq=%lu aseq=%lu",
+             (unsigned long)node_state.kernel_sequence,
+             (unsigned long)node_state.activation_sequence);
+    return true;
 }
 
 void init_sensors(void) {
@@ -216,6 +316,7 @@ bool set_kernel_values(const float values[KERNEL_SIZE]) {
     memcpy(node_state.kernel, values, sizeof(node_state.kernel));
     node_state.kernel_sequence++;
     strlcpy(kernel_function, "custom", sizeof(kernel_function));
+    save_state_config();
     ESP_LOGI(TAG, "Kernel updated, kseq=%lu", (unsigned long)node_state.kernel_sequence);
     return true;
 }
@@ -230,6 +331,7 @@ bool set_activation_rules(const activation_rule_t *rules, uint8_t count) {
     node_state.activation_count = count;
     node_state.activation_sequence++;
     describe_activation_rules();
+    save_state_config();
     ESP_LOGI(TAG, "Activations updated, count=%u aseq=%lu",
              node_state.activation_count, (unsigned long)node_state.activation_sequence);
     return true;
@@ -253,6 +355,7 @@ bool load_preset(const char *preset_name) {
     node_state.activation_sequence++;
     strlcpy(kernel_function, preset_name, sizeof(kernel_function));
     describe_activation_rules();
+    save_state_config();
     ESP_LOGI(TAG, "Loaded preset '%s' kseq=%lu aseq=%lu", preset_name,
              (unsigned long)node_state.kernel_sequence,
              (unsigned long)node_state.activation_sequence);
@@ -283,11 +386,13 @@ void toggle_state_value(void) {
 
 void adopt_neighbor_rules(const node_state_t *neighbor_state) {
     if (neighbor_state == NULL) return;
+    bool config_changed = false;
 
     if (neighbor_state->kernel_sequence > node_state.kernel_sequence) {
         memcpy(node_state.kernel, neighbor_state->kernel, sizeof(node_state.kernel));
         node_state.kernel_sequence = neighbor_state->kernel_sequence;
         strlcpy(kernel_function, "mesh", sizeof(kernel_function));
+        config_changed = true;
         ESP_LOGI(TAG, "Adopted newer kernel from mesh, kseq=%lu",
                  (unsigned long)node_state.kernel_sequence);
     }
@@ -297,8 +402,13 @@ void adopt_neighbor_rules(const node_state_t *neighbor_state) {
         node_state.activation_count = MIN(neighbor_state->activation_count, MAX_ACTIVATIONS);
         node_state.activation_sequence = neighbor_state->activation_sequence;
         describe_activation_rules();
+        config_changed = true;
         ESP_LOGI(TAG, "Adopted newer activations from mesh, aseq=%lu",
                  (unsigned long)node_state.activation_sequence);
+    }
+
+    if (config_changed) {
+        save_state_config();
     }
 
     if (neighbor_state->value_sequence > node_state.value_sequence) {
@@ -360,11 +470,17 @@ void init_state(void) {
         node_state.kernel[i] = ((int32_t)(esp_random() % 20001) - 10000) / 10000.0f;
     }
 
+    bool loaded_config = load_state_config();
+    if (!loaded_config) {
+        save_state_config();
+    }
+
     init_leds();
     init_sensors();
     update_led_color();
     node_state.state = node_state.value ? NODE_STATE_ACTIVE : NODE_STATE_IDLE;
-    ESP_LOGI(TAG, "State manager initialized value=%u kernel=random", node_state.value);
+    ESP_LOGI(TAG, "State manager initialized value=%u kernel=%s",
+             node_state.value, loaded_config ? kernel_function : "random");
 }
 
 void update_state(void) {
