@@ -62,6 +62,7 @@ typedef struct {
 #endif
 
 // Mesh configuration
+#define MESH_TARGET_NODE_COUNT 1000
 #define MESH_MAX_HOPS 10
 #define MESH_VOTE_PERCENT 1
 #define MESH_AP_CONNECTIONS 6
@@ -136,6 +137,12 @@ typedef struct {
 #define MQTT_STATE_TOPIC "mesh/state"
 #define MQTT_COMMAND_TOPIC "mesh/commands"
 #define MQTT_UPDATE_INTERVAL_MS 5000
+#ifndef MESH_HEALTH_CHECK_INTERVAL_MS
+#define MESH_HEALTH_CHECK_INTERVAL_MS 10000
+#endif
+#ifndef MESH_RECONNECT_RESTART_MS
+#define MESH_RECONNECT_RESTART_MS 60000
+#endif
 
 // ============================================================================
 // TX Power Settings
@@ -163,7 +170,9 @@ typedef struct {
 // Neighbor Settings
 // ============================================================================
 
-// Neighbor Settings - can be overridden via build flags
+// Neighbor Settings - can be overridden via build flags.
+// Keep this bounded: it is the local neighborhood used by the activation
+// kernel, not the total mesh size.
 #ifndef MAX_NEIGHBORS
 #define MAX_NEIGHBORS 8
 #endif
@@ -175,6 +184,12 @@ typedef struct {
 #endif
 #define NEIGHBOR_TIMEOUT_MS 5000
 #define BEACON_SCAN_INTERVAL 100
+#ifndef MQTT_TOPOLOGY_ROUTE_SAMPLE_LIMIT
+#define MQTT_TOPOLOGY_ROUTE_SAMPLE_LIMIT 16
+#endif
+#ifndef MQTT_TOPOLOGY_NEIGHBOR_SAMPLE_LIMIT
+#define MQTT_TOPOLOGY_NEIGHBOR_SAMPLE_LIMIT 8
+#endif
 
 // ============================================================================
 // State Management Settings

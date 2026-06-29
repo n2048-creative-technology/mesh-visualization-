@@ -282,8 +282,34 @@ void mqtt_disconnect(void) {
     }
 }
 
-void mqtt_publish_state(void) {
+static void format_kernel_json(const node_state_t *state, char *kernel, size_t kernel_len) {
+    size_t offset = 0;
+    offset += snprintf(kernel + offset, kernel_len - offset, "[");
+    for (int i = 0; i < KERNEL_SIZE && offset < kernel_len; ++i) {
+        offset += snprintf(kernel + offset, kernel_len - offset, "%s%.4f",
+                           i == 0 ? "" : ",", state->kernel[i]);
+    }
+    snprintf(kernel + offset, kernel_len - offset, "]");
+}
+
+static void format_activations_json(const node_state_t *state, char *activations, size_t activations_len) {
+    size_t offset = 0;
+    offset += snprintf(activations + offset, activations_len - offset, "[");
+    for (uint8_t i = 0; i < state->activation_count && offset < activations_len; ++i) {
+        offset += snprintf(activations + offset, activations_len - offset,
+                           "%s{\"op\":%u,\"value\":%.4f}",
+                           i == 0 ? "" : ",",
+                           state->activations[i].op,
+                           state->activations[i].value);
+    }
+    snprintf(activations + offset, activations_len - offset, "]");
+}
+
+void mqtt_publish_node_state(const uint8_t *node_mac_value, const node_state_t *state) {
     if (!mqtt_connected || mqtt_client == NULL) {
+        return;
+    }
+    if (node_mac_value == NULL || state == NULL) {
         return;
     }
 
@@ -291,26 +317,9 @@ void mqtt_publish_state(void) {
     char kernel[192];
     char activations[256];
     char payload[1024];
-    snprintf(mac, sizeof(mac), MACSTR, MAC2STR(node_mac));
-
-    size_t offset = 0;
-    offset += snprintf(kernel + offset, sizeof(kernel) - offset, "[");
-    for (int i = 0; i < KERNEL_SIZE && offset < sizeof(kernel); ++i) {
-        offset += snprintf(kernel + offset, sizeof(kernel) - offset, "%s%.4f",
-                           i == 0 ? "" : ",", node_state.kernel[i]);
-    }
-    snprintf(kernel + offset, sizeof(kernel) - offset, "]");
-
-    offset = 0;
-    offset += snprintf(activations + offset, sizeof(activations) - offset, "[");
-    for (uint8_t i = 0; i < node_state.activation_count && offset < sizeof(activations); ++i) {
-        offset += snprintf(activations + offset, sizeof(activations) - offset,
-                           "%s{\"op\":%u,\"value\":%.4f}",
-                           i == 0 ? "" : ",",
-                           node_state.activations[i].op,
-                           node_state.activations[i].value);
-    }
-    snprintf(activations + offset, sizeof(activations) - offset, "]");
+    snprintf(mac, sizeof(mac), MACSTR, MAC2STR(node_mac_value));
+    format_kernel_json(state, kernel, sizeof(kernel));
+    format_activations_json(state, activations, sizeof(activations));
 
     snprintf(payload, sizeof(payload),
              "{\"mac\":\"%s\",\"state\":%u,\"temperature\":%d,"
@@ -321,18 +330,22 @@ void mqtt_publish_state(void) {
              "\"activation_sequence\":%lu,\"activation_count\":%u,"
              "\"kernel\":%s,\"activations\":%s,"
              "\"color\":[%u,%u,%u]}",
-             mac, node_state.state, node_state.temperature,
-             node_state.mmwave_presence, (unsigned long)node_state.mmwave_distance,
-             (unsigned long)node_state.timestamp,
-             node_state.value, node_state.activation_sum,
+             mac, state->state, state->temperature,
+             state->mmwave_presence, (unsigned long)state->mmwave_distance,
+             (unsigned long)state->timestamp,
+             state->value, state->activation_sum,
              get_kernel_function(), get_activation_function(),
-             (unsigned long)node_state.kernel_sequence,
-             (unsigned long)node_state.value_sequence,
-             (unsigned long)node_state.activation_sequence,
-             node_state.activation_count, kernel, activations,
-             node_state.color[0], node_state.color[1], node_state.color[2]);
+             (unsigned long)state->kernel_sequence,
+             (unsigned long)state->value_sequence,
+             (unsigned long)state->activation_sequence,
+             state->activation_count, kernel, activations,
+             state->color[0], state->color[1], state->color[2]);
 
     esp_mqtt_client_publish(mqtt_client, MQTT_STATE_TOPIC, payload, 0, 0, 0);
+}
+
+void mqtt_publish_state(void) {
+    mqtt_publish_node_state(node_mac, &node_state);
 }
 
 void mqtt_publish_topology_and_state(void) {
@@ -349,13 +362,17 @@ void mqtt_publish_topology(void) {
 
     char mac[18];
     char neighbors[512];
-    char payload[768];
+    char routing[640];
+    char payload[2400];
     snprintf(mac, sizeof(mac), MACSTR, MAC2STR(node_mac));
 
     size_t offset = 0;
     offset += snprintf(neighbors + offset, sizeof(neighbors) - offset, "[");
     bool first = true;
-    for (int i = 0; i < MAX_NEIGHBORS && offset < sizeof(neighbors); i++) {
+    int neighbor_sample_count = 0;
+    for (int i = 0; i < MAX_NEIGHBORS &&
+                    neighbor_sample_count < MQTT_TOPOLOGY_NEIGHBOR_SAMPLE_LIMIT &&
+                    offset < sizeof(neighbors); i++) {
         if (!neighbor_list[i].active) continue;
 
         char neighbor_mac[18];
@@ -366,18 +383,49 @@ void mqtt_publish_topology(void) {
                            (unsigned long)neighbor_list[i].last_seen,
                            neighbor_list[i].has_state ? neighbor_list[i].state.value : 0);
         first = false;
+        neighbor_sample_count++;
     }
     snprintf(neighbors + offset, sizeof(neighbors) - offset, "]");
 
     int layer = mesh_initialized ? esp_mesh_get_layer() : 0;
     int rtable_size = mesh_initialized ? esp_mesh_get_routing_table_size() : 0;
+    int route_count = 0;
+    mesh_addr_t route_table[MQTT_TOPOLOGY_ROUTE_SAMPLE_LIMIT] = {};
+
+    if (mesh_initialized && rtable_size > 0) {
+        int requested = MIN(rtable_size, (int)(sizeof(route_table) / sizeof(route_table[0])));
+        esp_err_t err = esp_mesh_get_routing_table(route_table,
+                                                   requested * sizeof(mesh_addr_t),
+                                                   &route_count);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "Failed to read mesh routing table: %s", esp_err_to_name(err));
+            route_count = 0;
+        }
+    }
+
+    offset = 0;
+    offset += snprintf(routing + offset, sizeof(routing) - offset, "[");
+    for (int i = 0; i < route_count && offset < sizeof(routing); i++) {
+        char route_mac[18];
+        snprintf(route_mac, sizeof(route_mac), MACSTR, MAC2STR(route_table[i].addr));
+        offset += snprintf(routing + offset, sizeof(routing) - offset,
+                           "%s\"%s\"", i == 0 ? "" : ",", route_mac);
+    }
+    snprintf(routing + offset, sizeof(routing) - offset, "]");
 
     snprintf(payload, sizeof(payload),
              "{\"node_mac\":\"%s\",\"node_state\":%u,\"value\":%u,"
-             "\"layer\":%d,\"routing_table_size\":%d,\"neighbor_count\":%d,"
-             "\"neighbors\":%s}",
+             "\"layer\":%d,\"target_node_count\":%d,"
+             "\"routing_table_size\":%d,\"route_sample_count\":%d,"
+             "\"routing_table_truncated\":%s,"
+             "\"neighbor_count\":%d,\"neighbor_sample_count\":%d,"
+             "\"neighbors\":%s,\"routing_table\":%s,\"routing_table_sample\":%s}",
              mac, node_state.state, node_state.value,
-             layer, rtable_size, get_neighbor_count(), neighbors);
+             layer, MESH_TARGET_NODE_COUNT,
+             rtable_size, route_count,
+             route_count < rtable_size ? "true" : "false",
+             get_neighbor_count(), neighbor_sample_count,
+             neighbors, routing, routing);
 
     esp_mqtt_client_publish(mqtt_client, MQTT_TOPOLOGY_TOPIC, payload, 0, 0, 0);
 }

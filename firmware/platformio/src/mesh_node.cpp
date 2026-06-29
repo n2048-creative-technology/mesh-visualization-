@@ -7,6 +7,7 @@
 
 #include "mesh_node.h"
 #include "config.h"
+#include "mqtt_handler.h"
 #include "state_manager.h"
 #include "esp_log.h"
 #include "esp_wifi.h"
@@ -16,6 +17,7 @@
 #include "lwip/sockets.h"
 #include "lwip/netdb.h"
 #include "lwip/inet.h"
+#include <stddef.h>
 #include "string.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -30,10 +32,14 @@ int8_t current_tx_power = 8;
 int udp_socket = -1;
 bool mesh_initialized = false;
 bool wifi_initialized = false;
+mesh_addr_t current_root_addr = {};
+bool has_current_root_addr = false;
 
 // Message sequence number
 static uint32_t message_sequence = 0;
 static const uint8_t mesh_id[6] = {0x47, 0x4c, 0x4f, 0x57, 0x20, 0x01};
+static bool mesh_stack_initialized = false;
+static bool mesh_rx_task_started = false;
 
 static void mesh_receive_task(void *arg);
 
@@ -82,8 +88,15 @@ void init_wifi(void) {
  */
 void init_mesh(void) {
     ESP_LOGI(TAG, "Initializing ESP-WiFi-Mesh");
-    
-    ESP_ERROR_CHECK(esp_mesh_init());
+
+    if (!mesh_stack_initialized) {
+        esp_err_t init_err = esp_mesh_init();
+        if (init_err != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to initialize ESP-WiFi-Mesh: %s", esp_err_to_name(init_err));
+            return;
+        }
+        mesh_stack_initialized = true;
+    }
     
     ESP_ERROR_CHECK(esp_mesh_set_topology(MESH_TOPO_TREE));
     ESP_ERROR_CHECK(esp_mesh_set_max_layer(MESH_MAX_HOPS));
@@ -114,7 +127,10 @@ void init_mesh(void) {
     }
     
     mesh_initialized = true;
-    xTaskCreate(mesh_receive_task, "mesh_rx", 6144, NULL, 5, NULL);
+    if (!mesh_rx_task_started) {
+        xTaskCreate(mesh_receive_task, "mesh_rx", 6144, NULL, 5, NULL);
+        mesh_rx_task_started = true;
+    }
     ESP_LOGI(TAG, "ESP-WiFi-Mesh initialized");
 }
 
@@ -388,7 +404,7 @@ void trigger_neighbor_discovery(void) {
 uint16_t calculate_checksum(mesh_message_t *msg) {
     uint16_t checksum = 0;
     uint8_t *data = (uint8_t *)msg;
-    size_t len = sizeof(mesh_message_t) - sizeof(msg->checksum); // Exclude checksum field
+    size_t len = offsetof(mesh_message_t, checksum); // Exclude checksum field and trailing padding
     
     for (size_t i = 0; i < len; i++) {
         checksum += data[i];
@@ -404,7 +420,7 @@ uint16_t calculate_checksum(mesh_message_t *msg) {
 uint16_t calculate_udp_checksum(udp_message_t *msg) {
     uint16_t checksum = 0;
     uint8_t *data = (uint8_t *)msg;
-    size_t len = sizeof(udp_message_t) - sizeof(msg->checksum); // Exclude checksum field
+    size_t len = offsetof(udp_message_t, checksum); // Exclude checksum field
     
     for (size_t i = 0; i < len; i++) {
         checksum += data[i];
@@ -536,6 +552,7 @@ static void mesh_receive_task(void *arg) {
         adopt_neighbor_rules(&msg.state);
 
         if (esp_mesh_is_root()) {
+            mqtt_publish_node_state(msg.mac, &msg.state);
             forward_to_visualization(&msg);
         }
     }
@@ -552,7 +569,7 @@ void send_state_to_neighbors(void) {
     }
     
     // Build the message
-    mesh_message_t msg;
+    mesh_message_t msg = {};
     msg.version = PROTOCOL_VERSION;
     msg.msg_type = MSG_TYPE_STATE_UPDATE;
     memcpy(msg.mac, node_mac, 6);
@@ -587,6 +604,24 @@ void send_state_to_neighbors(void) {
     }
     
     msg.checksum = calculate_checksum(&msg);
+
+    mesh_data_t mesh_data;
+    mesh_data.data = (uint8_t*)&msg;
+    mesh_data.size = sizeof(mesh_message_t);
+    mesh_data.proto = MESH_PROTO_BIN;
+    mesh_data.tos = MESH_TOS_P2P;
+
+    if (!esp_mesh_is_root()) {
+        mesh_addr_t *dest = has_current_root_addr ? &current_root_addr : NULL;
+        int flag = has_current_root_addr ? MESH_DATA_P2P : MESH_DATA_TODS;
+        esp_err_t err = esp_mesh_send(dest, &mesh_data, flag, NULL, 0);
+        if (err == ESP_OK) {
+            ESP_LOGD(TAG, "State sent upward to mesh root");
+        } else {
+            ESP_LOGW(TAG, "Failed to send state upward to root: %s", esp_err_to_name(err));
+        }
+        return;
+    }
     
     // Send to each active neighbor
     for (int i = 0; i < MAX_NEIGHBORS; i++) {
@@ -594,13 +629,7 @@ void send_state_to_neighbors(void) {
             // Use mesh API to send data
             mesh_addr_t dest_addr;
             memcpy(dest_addr.addr, neighbor_list[i].mac, 6);
-            
-            // Prepare mesh_data_t
-            mesh_data_t mesh_data;
-            mesh_data.data = (uint8_t*)&msg;
-            mesh_data.size = sizeof(mesh_message_t);
-            mesh_data.proto = MESH_PROTO_BIN; // Binary protocol
-            
+
             esp_err_t err = esp_mesh_send(&dest_addr, &mesh_data, 
                                          MESH_DATA_P2P, NULL, 0);
             
@@ -624,7 +653,7 @@ void broadcast_state(void) {
     }
     
     // Build the message
-    mesh_message_t msg;
+    mesh_message_t msg = {};
     msg.version = PROTOCOL_VERSION;
     msg.msg_type = MSG_TYPE_STATE_UPDATE;
     memcpy(msg.mac, node_mac, 6);

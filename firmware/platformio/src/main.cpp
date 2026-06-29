@@ -12,6 +12,7 @@
 #include "esp_mesh.h"
 #include "esp_netif.h"
 #include "esp_mac.h"
+#include "esp_system.h"
 #include "esp_timer.h"
 #include "nvs_flash.h"
 #include "lwip/sockets.h"
@@ -29,6 +30,8 @@
 
 static const char *TAG = "MAIN";
 static esp_netif_t *mesh_netif_sta = NULL;
+static uint32_t last_mesh_attached_ms = 0;
+static uint32_t last_mesh_health_check_ms = 0;
 
 // Global MAC address
 uint8_t node_mac[6] = {0};
@@ -40,6 +43,10 @@ int tcp_server_socket = -1;
 void start_tcp_server(void);
 void send_state_update_to_visualization(void);
 bool has_ip_address(void);
+static bool state_publish_relevant_change(const node_state_t *previous, const node_state_t *current);
+static void init_nvs_storage(void);
+static bool mac_is_zero(const uint8_t *mac);
+static void check_mesh_health(uint32_t now);
 
 /**
  * IP event handler
@@ -73,6 +80,8 @@ void mesh_event_handler(void *arg, esp_event_base_t event_base,
         }
         case MESH_EVENT_STOPPED: {
             ESP_LOGI(TAG, "<MESH_EVENT_STOPPED>");
+            mesh_initialized = false;
+            has_current_root_addr = false;
             break;
         }
         case MESH_EVENT_CHILD_CONNECTED: {
@@ -90,7 +99,10 @@ void mesh_event_handler(void *arg, esp_event_base_t event_base,
         case MESH_EVENT_PARENT_CONNECTED: {
             mesh_event_connected_t *connected = (mesh_event_connected_t *)event_data;
             ESP_LOGI(TAG, "<MESH_EVENT_PARENT_CONNECTED>layer:%d", connected->self_layer);
+            last_mesh_attached_ms = esp_timer_get_time() / 1000;
             if (esp_mesh_is_root()) {
+                memcpy(current_root_addr.addr, node_mac, sizeof(current_root_addr.addr));
+                has_current_root_addr = true;
                 ESP_LOGI(TAG, "Node is ROOT - starting UDP and TCP services");
                 if (mesh_netif_sta != NULL) {
                     esp_err_t err = esp_netif_dhcpc_start(mesh_netif_sta);
@@ -108,14 +120,28 @@ void mesh_event_handler(void *arg, esp_event_base_t event_base,
             }
             break;
         }
+        case MESH_EVENT_ROOT_ADDRESS: {
+            mesh_event_root_address_t *root_addr = (mesh_event_root_address_t *)event_data;
+            memcpy(current_root_addr.addr, root_addr->addr, sizeof(current_root_addr.addr));
+            if (!esp_mesh_is_root() && current_root_addr.addr[5] > 0) {
+                current_root_addr.addr[5]--;
+            }
+            has_current_root_addr = true;
+            ESP_LOGI(TAG, "<MESH_EVENT_ROOT_ADDRESS>" MACSTR, MAC2STR(current_root_addr.addr));
+            break;
+        }
         case MESH_EVENT_PARENT_DISCONNECTED: {
             mesh_event_disconnected_t *disconnected = (mesh_event_disconnected_t *)event_data;
             ESP_LOGI(TAG, "<MESH_EVENT_PARENT_DISCONNECTED>reason:%d", disconnected->reason);
+            has_current_root_addr = false;
             break;
         }
         case MESH_EVENT_LAYER_CHANGE: {
             mesh_event_layer_change_t *layer_change = (mesh_event_layer_change_t *)event_data;
             ESP_LOGI(TAG, "<MESH_EVENT_LAYER_CHANGE>new_layer:%d", layer_change->new_layer);
+            if (layer_change->new_layer > 0) {
+                last_mesh_attached_ms = esp_timer_get_time() / 1000;
+            }
             break;
         }
         case MESH_EVENT_NO_PARENT_FOUND: {
@@ -344,6 +370,74 @@ bool has_ip_address(void) {
     return false;
 }
 
+static bool state_publish_relevant_change(const node_state_t *previous, const node_state_t *current) {
+    if (previous == NULL || current == NULL) {
+        return true;
+    }
+
+    return previous->state != current->state ||
+           previous->value != current->value ||
+           previous->temperature != current->temperature ||
+           previous->mmwave_presence != current->mmwave_presence ||
+           previous->mmwave_distance != current->mmwave_distance ||
+           previous->kernel_sequence != current->kernel_sequence ||
+           previous->value_sequence != current->value_sequence ||
+           previous->activation_sequence != current->activation_sequence;
+}
+
+static void init_nvs_storage(void) {
+    esp_err_t err = nvs_flash_init();
+    if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_LOGW(TAG, "NVS needs recovery (%s), erasing NVS partition", esp_err_to_name(err));
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        err = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(err);
+}
+
+static bool mac_is_zero(const uint8_t *mac) {
+    static const uint8_t zero_mac[6] = {0};
+    return mac == NULL || memcmp(mac, zero_mac, sizeof(zero_mac)) == 0;
+}
+
+static void check_mesh_health(uint32_t now) {
+    if (now - last_mesh_health_check_ms < MESH_HEALTH_CHECK_INTERVAL_MS) {
+        return;
+    }
+    last_mesh_health_check_ms = now;
+
+    if (!mesh_initialized) {
+        ESP_LOGW(TAG, "Mesh is not initialized; retrying mesh initialization");
+        init_mesh();
+        return;
+    }
+
+    int layer = esp_mesh_get_layer();
+    if (layer > 0) {
+        last_mesh_attached_ms = now;
+        return;
+    }
+
+    if (last_mesh_attached_ms == 0) {
+        last_mesh_attached_ms = now;
+        return;
+    }
+
+    if (now - last_mesh_attached_ms >= MESH_RECONNECT_RESTART_MS) {
+        ESP_LOGW(TAG, "Mesh has been detached for %lu ms; restarting mesh stack",
+                 (unsigned long)(now - last_mesh_attached_ms));
+        has_current_root_addr = false;
+        mesh_initialized = false;
+        esp_err_t err = esp_mesh_stop();
+        if (err != ESP_OK && err != ESP_ERR_MESH_NOT_START) {
+            ESP_LOGW(TAG, "Failed to stop mesh before restart: %s", esp_err_to_name(err));
+        }
+        vTaskDelay(pdMS_TO_TICKS(500));
+        init_mesh();
+        last_mesh_attached_ms = now;
+    }
+}
+
 /**
  * Application main entry point for ESP-IDF
  */
@@ -355,7 +449,7 @@ extern "C" void app_main(void)
     ESP_LOGI(TAG, "WiFi Channel: %d", WIFI_CHANNEL);
     
     // Initialize NVS
-    ESP_ERROR_CHECK(nvs_flash_init());
+    init_nvs_storage();
     
     // Initialize TCP/IP stack
     ESP_ERROR_CHECK(esp_netif_init());
@@ -385,6 +479,11 @@ extern "C" void app_main(void)
     
     // Get MAC address
     ESP_ERROR_CHECK(esp_wifi_get_mac(WIFI_IF_STA, node_mac));
+    if (mac_is_zero(node_mac)) {
+        ESP_LOGE(TAG, "WiFi returned a zero MAC; erasing NVS and restarting");
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        esp_restart();
+    }
     ESP_LOGI(TAG, "MAC Address: " MACSTR, MAC2STR(node_mac));
     
     // Initialize platform
@@ -406,22 +505,41 @@ extern "C" void app_main(void)
     
     // Main loop
     uint32_t last_state_update = 0;
+    uint32_t last_mesh_state_publish = 0;
 #if ENABLE_WIFI_NEIGHBOR_SCAN
     uint32_t last_neighbor_scan = 0;
 #endif
     uint32_t last_visualization_update = 0;
+    node_state_t last_published_state = {};
+    bool has_published_state = false;
     
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(100));
         
         uint32_t now = esp_timer_get_time() / 1000; // ms
+
+        check_mesh_health(now);
         
         // Update state (read sensors, etc.)
         if (now - last_state_update >= STATE_UPDATE_INTERVAL) {
             last_state_update = now;
             update_state();
             update_led_color();
-            send_state_to_neighbors();
+
+            bool state_changed = !has_published_state ||
+                                 state_publish_relevant_change(&last_published_state, &node_state);
+            bool periodic_due = now - last_mesh_state_publish >= MQTT_UPDATE_INTERVAL_MS;
+            if (state_changed || periodic_due) {
+                last_mesh_state_publish = now;
+                last_published_state = node_state;
+                has_published_state = true;
+                send_state_to_neighbors();
+#if ENABLE_MQTT_VISUALIZATION
+                if (esp_mesh_is_root() && is_mqtt_connected()) {
+                    mqtt_publish_topology_and_state();
+                }
+#endif
+            }
         }
         
         // Trigger neighbor discovery
@@ -438,11 +556,6 @@ extern "C" void app_main(void)
         if (can_send_to_viz && now - last_visualization_update >= 1000) {
             last_visualization_update = now;
             send_state_update_to_visualization();
-#if ENABLE_MQTT_VISUALIZATION
-            if (is_mqtt_connected() && now % MQTT_UPDATE_INTERVAL_MS < 1000) {
-                mqtt_publish_topology_and_state();
-            }
-#endif
         }
         
         // Handle TCP clients

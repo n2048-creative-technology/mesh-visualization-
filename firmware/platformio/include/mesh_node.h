@@ -98,6 +98,8 @@ extern uint8_t node_mac[6];
 extern int udp_socket;
 extern bool mesh_initialized;
 extern bool wifi_initialized;
+extern mesh_addr_t current_root_addr;
+extern bool has_current_root_addr;
 
 // Function Declarations for UDP message handling
 void prepare_udp_message(udp_message_t *msg);

@@ -47,6 +47,7 @@ let mqttConnected = false;
 
 // Node state storage
 const nodes = {};
+const STALE_NODE_TIMEOUT_MS = Number(process.env.STALE_NODE_TIMEOUT_MS || 30000);
 
 // Message statistics
 let messageCount = 0;
@@ -231,6 +232,66 @@ function convertMqttTopologyToNode(topologyMsg) {
     return node;
 }
 
+function createPlaceholderNode(mac) {
+    return {
+        version: PROTOCOL_VERSION,
+        msgType: MSG_TYPE_STATE_UPDATE,
+        mac,
+        state: 1,
+        color: { r: 128, g: 128, b: 128 },
+        temperature: 0,
+        mmwavePresence: false,
+        mmwaveDistance: 0,
+        timestamp: Math.floor(Date.now() / 1000),
+        neighbors: [],
+        receivedAt: Date.now(),
+        discoveredFromTopology: true
+    };
+}
+
+function ensureTopologyNode(mac, referencedBy = null) {
+    if (!mac || typeof mac !== 'string') return null;
+
+    if (!nodes[mac]) {
+        nodes[mac] = createPlaceholderNode(mac);
+    }
+
+    nodes[mac].receivedAt = Date.now();
+
+    if (referencedBy && !nodes[mac].neighbors.some(n => n.mac === referencedBy)) {
+        nodes[mac].neighbors.push({ mac: referencedBy, rssi: -127 });
+    }
+
+    return nodes[mac];
+}
+
+function ensureTopologyReferences(topologyMsg, sourceMac) {
+    const referenced = new Set();
+    const referencedNodes = [];
+
+    if (Array.isArray(topologyMsg.neighbors)) {
+        for (const neighbor of topologyMsg.neighbors) {
+            if (neighbor && neighbor.mac) referenced.add(neighbor.mac);
+        }
+    }
+
+    const routeSample = topologyMsg.routing_table_sample || topologyMsg.routing_table || [];
+    if (Array.isArray(routeSample)) {
+        for (const mac of routeSample) {
+            if (mac) referenced.add(mac);
+        }
+    }
+
+    referenced.delete(sourceMac);
+
+    for (const mac of referenced) {
+        const referencedNode = ensureTopologyNode(mac, sourceMac);
+        if (referencedNode) referencedNodes.push(referencedNode);
+    }
+
+    return referencedNodes;
+}
+
 /**
  * Convert MQTT state message to node update format
  * MQTT state message format:
@@ -387,12 +448,21 @@ function handleMqttMessage(topic, payload) {
             existingNode.mmwavePresence = node.mmwavePresence;
             existingNode.mmwaveDistance = node.mmwaveDistance;
             existingNode.timestamp = node.timestamp;
+            existingNode.discoveredFromTopology = false;
         }
         existingNode.receivedAt = Date.now();
         node = existingNode;
     } else {
         // Create new node
         nodes[node.mac] = node;
+    }
+
+    const additionalUpdates = [];
+    if (topic === MQTT_TOPOLOGY_TOPIC) {
+        additionalUpdates.push(...ensureTopologyReferences(payload, node.mac));
+        if (additionalUpdates.length > 0) {
+            console.log(`MQTT: Topology referenced ${additionalUpdates.length} additional node(s)`);
+        }
     }
 
     // Broadcast to all WebSocket clients
@@ -402,6 +472,12 @@ function handleMqttMessage(topic, payload) {
                 type: 'node_update', 
                 data: node 
             }));
+            for (const update of additionalUpdates) {
+                client.send(JSON.stringify({
+                    type: 'node_update',
+                    data: update
+                }));
+            }
         }
     });
 
@@ -572,7 +648,7 @@ process.on('SIGINT', () => {
 // Periodic cleanup
 setInterval(() => {
     const now = Date.now();
-    const timeout = 10000; // 10 seconds
+    const timeout = STALE_NODE_TIMEOUT_MS;
     
     for (const [mac, node] of Object.entries(nodes)) {
         if (now - node.receivedAt > timeout) {
