@@ -103,6 +103,17 @@ Supported JSON fields:
 }
 ```
 
+Targeted value toggle from the visualization:
+
+```json
+{
+  "command": "toggle",
+  "target_mac": "e8:f6:0a:16:ee:6c"
+}
+```
+
+The elected root receives this MQTT command, sends an internal ESP-WiFi-Mesh command to `target_mac`, and the target toggles its binary `value`. The LED follows `value`; the command value is held for `COMMAND_VALUE_HOLD_MS` before normal activation/kernel updates resume.
+
 Activation op values:
 
 | op | Meaning |
@@ -236,6 +247,47 @@ Returns a map keyed by MAC address.
 
 Returns MQTT connection status and topic configuration.
 
+### `POST /api/nodes/:mac/toggle`
+
+Publishes a targeted MQTT toggle command through the visualization server.
+
+```json
+{
+  "ok": true,
+  "target_mac": "e8:f6:0a:16:ee:6c"
+}
+```
+
+### `POST /api/config`
+
+Publishes a global kernel/activation command through the visualization server. The root applies the command locally and forwards updated state/config through the mesh so child nodes can adopt the new sequence.
+
+```json
+{
+  "kernel": [1, 1, 1, 1, 1, 1, 1, 1, 0],
+  "activations": [
+    {"op": 3, "value": 4.5}
+  ]
+}
+```
+
+Preset commands can also be sent:
+
+```json
+{
+  "preset": "conway"
+}
+```
+
+Successful response:
+
+```json
+{
+  "ok": true,
+  "command": "config_update"
+}
+```
+
 ## WebSocket
 
 Browser clients connect to:
@@ -289,10 +341,65 @@ Sent every 5 seconds.
 }
 ```
 
+Client-to-server message types:
+
+### `toggle_node`
+
+Sent by the browser when a graph node is clicked.
+
+```json
+{
+  "type": "toggle_node",
+  "mac": "e8:f6:0a:16:ee:6c"
+}
+```
+
+The server responds with:
+
+```json
+{
+  "type": "command_result",
+  "data": {
+    "ok": true,
+    "target_mac": "e8:f6:0a:16:ee:6c"
+  }
+}
+```
+
+### `config_update`
+
+Sent by the browser Configure tab to edit the kernel and activation rules for all nodes.
+
+```json
+{
+  "type": "config_update",
+  "data": {
+    "kernel": [1, 1, 1, 1, 1, 1, 1, 1, 0],
+    "activations": [
+      {"op": 3, "value": 4.5}
+    ]
+  }
+}
+```
+
+The same message type may send a preset:
+
+```json
+{
+  "type": "config_update",
+  "data": {
+    "preset": "majority"
+  }
+}
+```
+
+The server responds with `command_result`; on success, `data.command` is `config_update`.
+
 ## Timing and Cleanup
 
 - Firmware updates sensors and LED state every `STATE_UPDATE_INTERVAL`.
 - Firmware publishes/sends state every `MQTT_UPDATE_INTERVAL_MS` and on meaningful state changes.
+- Passive beacon RSSI neighbor discovery and ESP-NOW local status exchange continue even when no mesh route or router is available.
 - Visualization stale-node cleanup defaults to 30 seconds and can be configured with `STALE_NODE_TIMEOUT_MS`.
 - Mesh health check defaults to 10 seconds.
 - Mesh stack restart after detachment defaults to 60 seconds.

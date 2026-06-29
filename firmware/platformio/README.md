@@ -64,10 +64,16 @@ If PlatformIO monitor is run from automation, it may need a pseudo-terminal.
 - Root connects to router, starts MQTT, and publishes state/topology.
 - Non-root nodes send `mesh_message_t` upward to the root.
 - State is sent every `MQTT_UPDATE_INTERVAL_MS` and on meaningful state changes.
-- Mesh attach, root address, routing-table, child attach/detach, and root IP events request an immediate state/topology publish.
+- Passive beacon RSSI discovery updates the local neighbor table even before a mesh parent is found.
+- ESP-NOW broadcasts compact local status so nearby nodes can share `value`/state without mesh routing.
+- Mesh attach, root address, routing-table, child attach/detach, and root IP events request an immediate state publish.
+- Topology is published on mesh/IP/routing events and on the 5-second heartbeat, not on every activation flip.
 - LED fade color does not trigger early state publishes.
 - ESP-WiFi-Mesh self-organization is explicitly enabled and fixed-root mode is disabled.
 - Mesh health watchdog requests reconnect after short detachment and restarts the mesh stack after long detachment.
+- Router loss pauses the MQTT bridge, but does not force mesh reconnects or stop local neighbor behavior.
+- Targeted MQTT toggle commands are received by the root, forwarded through ESP-WiFi-Mesh, and reflected in the target node value/LED.
+- Global MQTT preset/kernel/activation commands are applied by the root and broadcast through current mesh routes so child nodes adopt the newer config sequences.
 - NVS initialization recovers common NVS errors; zero Wi-Fi MAC triggers NVS erase and restart.
 
 ## Important Configuration
@@ -83,13 +89,15 @@ Configuration is in `include/config.h`.
 | `MESH_MAX_HOPS` | Maximum mesh layers |
 | `MESH_AP_CONNECTIONS` | Max mesh children per AP |
 | `MAX_NEIGHBORS` | Local bounded neighbor table |
+| `ENABLE_BEACON_NEIGHBOR_DISCOVERY` | Passive beacon RSSI neighbor discovery |
+| `ENABLE_LOCAL_NEIGHBOR_STATUS` | ESP-NOW local status broadcast/receive |
 | `MQTT_BROKER_IP` | Broker used by root |
 | `MQTT_UPDATE_INTERVAL_MS` | 5-second heartbeat |
 | `MESH_HEALTH_CHECK_INTERVAL_MS` | 10-second health check |
 | `MESH_RECONNECT_ATTEMPT_MS` | 15-second detached reconnect request |
 | `MESH_RECONNECT_RESTART_MS` | 60-second detached restart |
-| `MESH_ROOT_IP_RECOVERY_MS` | 45-second root IP recovery grace period |
 | `MESH_AP_ASSOC_EXPIRE_SECONDS` | 30-second quiet child association timeout |
+| `COMMAND_VALUE_HOLD_MS` | 5-second hold after targeted toggle before activation resumes |
 | `MQTT_TOPOLOGY_ROUTE_SAMPLE_LIMIT` | Bounded route sample size |
 | `MMWAVE_PRESENCE_PIN` | GPIO 5 |
 | `DATA_PIN` | WS2812 GPIO 10 |

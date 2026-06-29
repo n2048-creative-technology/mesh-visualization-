@@ -29,6 +29,7 @@ const WS_PORT = 3000;
 const MQTT_BROKER_URL = process.env.MQTT_BROKER_URL || 'mqtt://localhost:1883';
 const MQTT_TOPOLOGY_TOPIC = process.env.MQTT_TOPOLOGY_TOPIC || 'mesh/topology';
 const MQTT_STATE_TOPIC = process.env.MQTT_STATE_TOPIC || 'mesh/state';
+const MQTT_COMMAND_TOPIC = process.env.MQTT_COMMAND_TOPIC || 'mesh/commands';
 const MQTT_CLIENT_ID = process.env.MQTT_CLIENT_ID || 'mesh_visualization_server';
 
 // Log MQTT configuration at startup
@@ -36,6 +37,7 @@ console.log('MQTT Configuration:');
 console.log('  Broker URL:', MQTT_BROKER_URL);
 console.log('  Topology Topic:', MQTT_TOPOLOGY_TOPIC);
 console.log('  State Topic:', MQTT_STATE_TOPIC);
+console.log('  Command Topic:', MQTT_COMMAND_TOPIC);
 
 // MQTT Client
 let mqttClient = null;
@@ -88,8 +90,7 @@ const MSG_TYPE_FORWARD = 0x03;
  * - checksum (2 bytes)
  */
 function parseNodeUpdate(buffer) {
-    if (buffer.length < 77) {
-        console.warn(`Short message received: ${buffer.length} bytes`);
+    if (buffer.length !== 77) {
         return null;
     }
     
@@ -215,6 +216,7 @@ function convertMqttTopologyToNode(topologyMsg) {
         msgType: MSG_TYPE_STATE_UPDATE,
         mac: topologyMsg.node_mac,
         state: topologyMsg.node_state || 1, // default to idle
+        value: topologyMsg.value || 0,
         color: { r: 0, g: 255, b: 0 }, // default green
         temperature: 0, // will be updated from state message
         mmwavePresence: false,
@@ -245,6 +247,7 @@ function createPlaceholderNode(mac) {
         msgType: MSG_TYPE_STATE_UPDATE,
         mac,
         state: 1,
+        value: 0,
         color: { r: 128, g: 128, b: 128 },
         temperature: 0,
         mmwavePresence: false,
@@ -256,7 +259,7 @@ function createPlaceholderNode(mac) {
     };
 }
 
-function ensureTopologyNode(mac, referencedBy = null) {
+function ensureTopologyNode(mac) {
     if (!mac || typeof mac !== 'string') return null;
 
     if (!nodes[mac]) {
@@ -264,10 +267,6 @@ function ensureTopologyNode(mac, referencedBy = null) {
     }
 
     nodes[mac].receivedAt = Date.now();
-
-    if (referencedBy && !nodes[mac].neighbors.some(n => n.mac === referencedBy)) {
-        nodes[mac].neighbors.push({ mac: referencedBy, rssi: -127 });
-    }
 
     return nodes[mac];
 }
@@ -292,7 +291,7 @@ function ensureTopologyReferences(topologyMsg, sourceMac) {
     referenced.delete(sourceMac);
 
     for (const mac of referenced) {
-        const referencedNode = ensureTopologyNode(mac, sourceMac);
+        const referencedNode = ensureTopologyNode(mac);
         if (referencedNode) referencedNodes.push(referencedNode);
     }
 
@@ -313,11 +312,12 @@ function ensureTopologyReferences(topologyMsg, sourceMac) {
  * }
  */
 function convertMqttStateToNode(stateMsg) {
-    return {
+    const node = {
         version: PROTOCOL_VERSION,
         msgType: MSG_TYPE_STATE_UPDATE,
         mac: stateMsg.mac,
         state: stateMsg.state || 1,
+        value: stateMsg.value || 0,
         color: {
             r: stateMsg.color && Array.isArray(stateMsg.color) && stateMsg.color[0] !== undefined ? stateMsg.color[0] : 0,
             g: stateMsg.color && Array.isArray(stateMsg.color) && stateMsg.color[1] !== undefined ? stateMsg.color[1] : 255,
@@ -327,9 +327,30 @@ function convertMqttStateToNode(stateMsg) {
         mmwavePresence: (stateMsg.mmwave_presence || 0) !== 0,
         mmwaveDistance: stateMsg.mmwave_distance || 0,
         timestamp: stateMsg.timestamp || Math.floor(Date.now() / 1000),
-        neighbors: [], // will be populated from topology message
+        kernel_sequence: stateMsg.kernel_sequence,
+        value_sequence: stateMsg.value_sequence,
+        activation_sequence: stateMsg.activation_sequence,
+        activation_count: stateMsg.activation_count,
+        kernel_function: stateMsg.kernel_function,
+        activation_function: stateMsg.activation_function,
+        kernel: stateMsg.kernel,
+        activations: stateMsg.activations,
+        neighbors: [],
         receivedAt: Date.now()
     };
+
+    if (Array.isArray(stateMsg.neighbors)) {
+        for (const neighbor of stateMsg.neighbors) {
+            if (neighbor && neighbor.mac && neighbor.rssi !== undefined) {
+                node.neighbors.push({
+                    mac: neighbor.mac,
+                    rssi: neighbor.rssi
+                });
+            }
+        }
+    }
+
+    return node;
 }
 
 // ============================================================================
@@ -447,14 +468,27 @@ function handleMqttMessage(topic, payload) {
             // Update neighbors from topology message
             existingNode.neighbors = node.neighbors;
             existingNode.state = node.state;
+            existingNode.value = node.value;
         } else if (topic === MQTT_STATE_TOPIC) {
             // Update sensor data from state message
             existingNode.state = node.state;
+            existingNode.value = node.value;
             existingNode.color = node.color;
             existingNode.temperature = node.temperature;
             existingNode.mmwavePresence = node.mmwavePresence;
             existingNode.mmwaveDistance = node.mmwaveDistance;
             existingNode.timestamp = node.timestamp;
+            existingNode.kernel_sequence = node.kernel_sequence;
+            existingNode.value_sequence = node.value_sequence;
+            existingNode.activation_sequence = node.activation_sequence;
+            existingNode.activation_count = node.activation_count;
+            existingNode.kernel_function = node.kernel_function;
+            existingNode.activation_function = node.activation_function;
+            existingNode.kernel = node.kernel;
+            existingNode.activations = node.activations;
+            if (node.neighbors.length > 0) {
+                existingNode.neighbors = node.neighbors;
+            }
             existingNode.discoveredFromTopology = false;
         }
         existingNode.receivedAt = Date.now();
@@ -514,6 +548,108 @@ function disconnectMQTT() {
     }
 }
 
+function normalizeMac(mac) {
+    if (typeof mac !== 'string') return null;
+    const normalized = mac.trim().toLowerCase();
+    return /^([0-9a-f]{2}:){5}[0-9a-f]{2}$/.test(normalized) ? normalized : null;
+}
+
+function publishToggleCommand(mac) {
+    const targetMac = normalizeMac(mac);
+    if (!targetMac) {
+        return { ok: false, error: 'Invalid MAC address' };
+    }
+    if (!mqttConnected || !mqttClient) {
+        return { ok: false, error: 'MQTT is not connected' };
+    }
+
+    const currentNode = nodes[targetMac];
+    const payload = {
+        command: 'toggle',
+        target_mac: targetMac,
+        requested_value: currentNode && currentNode.state === 2 ? 0 : 1,
+        requested_at: Date.now()
+    };
+
+    mqttClient.publish(MQTT_COMMAND_TOPIC, JSON.stringify(payload), { qos: 0, retain: false });
+    console.log(`MQTT: Published toggle command for ${targetMac}`);
+    return { ok: true, target_mac: targetMac };
+}
+
+function publishHighlightCommand(mac, enabled) {
+    const targetMac = normalizeMac(mac);
+    if (!targetMac) {
+        return { ok: false, error: 'Invalid MAC address' };
+    }
+    if (!mqttConnected || !mqttClient) {
+        return { ok: false, error: 'MQTT is not connected' };
+    }
+
+    const payload = {
+        command: 'highlight',
+        target_mac: targetMac,
+        enabled: enabled === true,
+        requested_at: Date.now()
+    };
+
+    mqttClient.publish(MQTT_COMMAND_TOPIC, JSON.stringify(payload), { qos: 0, retain: false });
+    return { ok: true, target_mac: targetMac, highlighted: payload.enabled };
+}
+
+function normalizeConfigPayload(config) {
+    if (!config || typeof config !== 'object') {
+        return null;
+    }
+
+    const payload = {};
+
+    if (typeof config.preset === 'string' && config.preset.length > 0) {
+        payload.preset = config.preset;
+    }
+
+    if (Array.isArray(config.kernel)) {
+        const kernel = config.kernel.map(Number);
+        if (kernel.length !== 9 || kernel.some(v => !Number.isFinite(v))) {
+            return null;
+        }
+        payload.kernel = kernel;
+    }
+
+    if (Array.isArray(config.activations)) {
+        const activations = config.activations.map(rule => ({
+            op: Number(rule.op),
+            value: Number(rule.value)
+        }));
+        if (activations.length > 8 ||
+            activations.some(rule => !Number.isInteger(rule.op) || rule.op < 0 || rule.op > 4 || !Number.isFinite(rule.value))) {
+            return null;
+        }
+        payload.activations = activations;
+    }
+
+    if (config.reset === true) {
+        payload.reset = true;
+    }
+
+    return Object.keys(payload).length > 0 ? payload : null;
+}
+
+function publishConfigCommand(config) {
+    if (!mqttConnected || !mqttClient) {
+        return { ok: false, error: 'MQTT is not connected' };
+    }
+
+    const payload = normalizeConfigPayload(config);
+    if (!payload) {
+        return { ok: false, error: 'Invalid config payload' };
+    }
+
+    payload.requested_at = Date.now();
+    mqttClient.publish(MQTT_COMMAND_TOPIC, JSON.stringify(payload), { qos: 0, retain: false });
+    console.log('MQTT: Published config command');
+    return { ok: true, command: 'config_update' };
+}
+
 // ============================================================================
 // Server Setup
 // ============================================================================
@@ -521,6 +657,8 @@ function disconnectMQTT() {
 // Create Express app
 const app = express();
 const server = require('http').createServer(app);
+
+app.use(express.json());
 
 // Serve static files
 app.use(express.static(path.join(__dirname, 'public')));
@@ -564,8 +702,39 @@ app.get('/api/mqtt', (req, res) => {
         broker: MQTT_BROKER_URL,
         topologyTopic: MQTT_TOPOLOGY_TOPIC,
         stateTopic: MQTT_STATE_TOPIC,
+        commandTopic: MQTT_COMMAND_TOPIC,
         clientId: MQTT_CLIENT_ID
     });
+});
+
+app.post('/api/nodes/:mac/toggle', (req, res) => {
+    const result = publishToggleCommand(req.params.mac);
+    if (!result.ok) {
+        res.status(result.error === 'MQTT is not connected' ? 503 : 400).json(result);
+        return;
+    }
+
+    res.json(result);
+});
+
+app.post('/api/nodes/:mac/highlight', (req, res) => {
+    const result = publishHighlightCommand(req.params.mac, req.body && req.body.enabled === true);
+    if (!result.ok) {
+        res.status(result.error === 'MQTT is not connected' ? 503 : 400).json(result);
+        return;
+    }
+
+    res.json(result);
+});
+
+app.post('/api/config', (req, res) => {
+    const result = publishConfigCommand(req.body);
+    if (!result.ok) {
+        res.status(result.error === 'MQTT is not connected' ? 503 : 400).json(result);
+        return;
+    }
+
+    res.json(result);
 });
 
 // WebSocket server
@@ -584,6 +753,10 @@ connectMQTT();
 udpSocket.on('message', (buffer, remote) => {
     messageCount++;
     lastMessageTime = Date.now();
+
+    if (buffer.length !== 77) {
+        return;
+    }
     
     // Parse the message
     const node = parseNodeUpdate(buffer);
@@ -628,6 +801,36 @@ wss.on('connection', (ws) => {
     
     ws.on('close', () => {
         console.log('WebSocket client disconnected');
+    });
+
+    ws.on('message', (message) => {
+        try {
+            const payload = JSON.parse(message.toString());
+            if (payload.type === 'toggle_node') {
+                const result = publishToggleCommand(payload.mac);
+                ws.send(JSON.stringify({
+                    type: 'command_result',
+                    data: result
+                }));
+            } else if (payload.type === 'highlight_node') {
+                const result = publishHighlightCommand(payload.mac, payload.enabled === true);
+                ws.send(JSON.stringify({
+                    type: 'command_result',
+                    data: result
+                }));
+            } else if (payload.type === 'config_update') {
+                const result = publishConfigCommand(payload.data);
+                ws.send(JSON.stringify({
+                    type: 'command_result',
+                    data: result
+                }));
+            }
+        } catch (error) {
+            ws.send(JSON.stringify({
+                type: 'command_result',
+                data: { ok: false, error: error.message }
+            }));
+        }
     });
     
     ws.on('error', (err) => {

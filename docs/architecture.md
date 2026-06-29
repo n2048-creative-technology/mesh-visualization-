@@ -1,11 +1,15 @@
 # Architecture
 
-This project combines ESP-WiFi-Mesh firmware, MQTT state publishing, and a browser visualization. The current implementation is root-forwarded: all ESP32 nodes form a mesh, non-root nodes send state frames upward, and the elected root bridges the mesh to MQTT and UDP visualization output.
+This project combines local ESP32 neighbor behavior, ESP-WiFi-Mesh firmware, MQTT state publishing, and a browser visualization. Local neighbor discovery/status exchange is independent of mesh attachment. ESP-WiFi-Mesh is used as the routed bridge to the elected root, and the root bridges the mesh to MQTT and UDP visualization output when the router/broker is reachable.
 
 ## Runtime Topology
 
 ```text
 ESP32-C3 nodes
+  |
+  | Passive beacon RSSI + ESP-NOW local status, works without mesh
+  v
+Local neighbor tables
   |
   | ESP-WiFi-Mesh tree, dynamic root election, self-healing
   v
@@ -29,18 +33,21 @@ ESP-WiFi-Mesh chooses the root. The root can change when devices reboot, disappe
 
 - Initializes NVS with recovery for `ESP_ERR_NVS_NO_FREE_PAGES` and `ESP_ERR_NVS_NEW_VERSION_FOUND`.
 - Guards against zero Wi-Fi MAC by erasing NVS and restarting.
-- Initializes Wi-Fi, ESP-WiFi-Mesh, state management, UDP, TCP command handling, and MQTT on root nodes.
+- Initializes Wi-Fi, passive beacon monitoring, ESP-NOW local status, ESP-WiFi-Mesh, state management, UDP, TCP command handling, and MQTT on root nodes.
 - Handles mesh events such as parent connect/disconnect, root address changes, layer changes, and root DHCP startup.
 - Runs the main loop:
   - Updates sensors and LED state every `STATE_UPDATE_INTERVAL`.
+  - Keeps the bounded local neighbor table fresh from passive beacon RSSI and ESP-NOW state broadcasts, even when the mesh is detached.
   - Publishes/sends state on meaningful state changes and every `MQTT_UPDATE_INTERVAL_MS`.
-  - Requests an immediate state/topology publish after mesh attach, root address, child attach/detach, routing-table, and IP events.
+  - Requests an immediate state publish after mesh attach, root address, child attach/detach, routing-table, and IP events.
+  - Publishes topology on mesh/IP/routing events and on the 5-second heartbeat, not on every activation flip.
   - Runs a mesh health watchdog.
 
 ### `mesh_node.cpp`
 
 - Configures ESP-WiFi-Mesh in tree topology.
 - Keeps a bounded local `neighbor_list[MAX_NEIGHBORS]`.
+- Broadcasts compact local status with ESP-NOW so nearby nodes can learn `value`/state without mesh routing.
 - Receives mesh state frames.
 - On root:
   - Publishes received child state to MQTT.
@@ -71,10 +78,11 @@ ESP-WiFi-Mesh is explicitly configured as self-organized, with fixed-root mode d
 - `MESH_HEALTH_CHECK_INTERVAL_MS`: health check period, default 10 seconds.
 - `MESH_RECONNECT_ATTEMPT_MS`: detached duration before explicitly calling `esp_mesh_connect()`, default 15 seconds.
 - `MESH_RECONNECT_RESTART_MS`: detached duration before restarting the mesh stack, default 60 seconds.
-- `MESH_ROOT_IP_RECOVERY_MS`: root grace period before forcing router-side recovery, default 45 seconds.
 - `MESH_AP_ASSOC_EXPIRE_SECONDS`: parent association timeout, default 30 seconds, so brief quiet periods do not immediately drop a child.
 
 If `esp_mesh_get_layer()` stays at 0, the node first asks ESP-WiFi-Mesh to reconnect. If it remains detached after the restart grace period, the firmware stops and restarts the mesh stack, then resumes normal join attempts. Parent disconnect events clear stale cached root addresses so nodes do not keep sending to an old root.
+
+Router loss is not treated as mesh failure. If the elected root has no router IP, the MQTT bridge is paused and DHCP is retried while the local mesh, passive RSSI neighbor discovery, and ESP-NOW local status exchange continue. When router IP returns, MQTT starts again, subscriptions resume, and the root publishes fresh topology/state.
 
 On recovery events, the node publishes immediately instead of waiting for the next 5-second heartbeat. During a mesh partition, the root's `routing_table_size` may temporarily shrink; the visualization reflects the mesh seen by the active root and fills back in as nodes rejoin.
 
@@ -142,14 +150,18 @@ Root
 MQTT publisher
   -> mesh/commands or mesh/commands/<root-mac>
   -> root MQTT client
-  -> local state/kernel/activation update
-  -> propagated through mesh state sequence adoption
+  -> targeted mesh command, root preset load, or root kernel/activation update
+  -> root broadcasts updated state/config to current mesh routes
+  -> target node toggles value/LED, or child nodes adopt newer config sequences
+  -> affected nodes report state back through root
 ```
 
 ## Known Constraints
 
 - The visualization server is in-memory. Restarting it clears node history.
 - Only the current root connects to MQTT.
+- Browser node clicks are routed through the visualization server and current mesh root as targeted toggles; child nodes do not need direct MQTT subscriptions.
+- Browser Configure tab changes are sent as MQTT config commands; the root applies them and fans out updated kernel/activation sequences to the current mesh routes.
 - A topology sample is not the full topology when `routing_table_truncated` is true.
 - The legacy UDP binary protocol is smaller than the internal mesh message and does not include activation kernels.
 - Very large deployments need broker/server/rendering rate control beyond the firmware-side bounded samples.

@@ -12,9 +12,18 @@ if [ ${#ports[@]} -eq 0 ]; then
   exit 1
 fi
 
+failures=()
+
 "$PIO" run
 
 for port in "${ports[@]}"; do
   echo "=== Uploading $port ==="
-  "$PIO" run -t nobuild -t upload --upload-port "$port"
+  if ! "$PIO" run -t nobuild -t upload --upload-port "$port"; then
+    failures+=("$port")
+  fi
 done
+
+if [ ${#failures[@]} -gt 0 ]; then
+  echo "Upload failed for: ${failures[*]}" >&2
+  exit 1
+fi

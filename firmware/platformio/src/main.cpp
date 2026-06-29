@@ -458,26 +458,18 @@ static void check_mesh_health(uint32_t now) {
                     last_root_ip_ok_ms = now;
                 }
 
+#if ENABLE_MQTT_VISUALIZATION
+                if (mqtt_client != NULL) {
+                    ESP_LOGW(TAG, "Root has no router IP; pausing MQTT bridge while local mesh continues");
+                    mqtt_disconnect();
+                }
+#endif
+
                 if (mesh_netif_sta != NULL) {
                     esp_err_t err = esp_netif_dhcpc_start(mesh_netif_sta);
                     if (err != ESP_OK && err != ESP_ERR_ESP_NETIF_DHCP_ALREADY_STARTED) {
                         ESP_LOGW(TAG, "Root DHCP recovery start failed: %s", esp_err_to_name(err));
                     }
-                }
-
-                if (now - last_root_ip_ok_ms >= MESH_ROOT_IP_RECOVERY_MS) {
-                    ESP_LOGW(TAG, "Root has had no router IP for %lu ms; requesting mesh reconnect",
-                             (unsigned long)(now - last_root_ip_ok_ms));
-                    has_current_root_addr = false;
-                    esp_err_t err = esp_mesh_disconnect();
-                    if (err != ESP_OK) {
-                        ESP_LOGW(TAG, "Root mesh disconnect request failed: %s", esp_err_to_name(err));
-                    }
-                    err = esp_mesh_connect();
-                    if (err != ESP_OK) {
-                        ESP_LOGW(TAG, "Root mesh reconnect request failed: %s", esp_err_to_name(err));
-                    }
-                    last_root_ip_ok_ms = now;
                 }
             }
         }
@@ -575,9 +567,18 @@ extern "C" void app_main(void)
     
     // Initialize neighbor list
     init_neighbor_list();
+
+#if ENABLE_LOCAL_NEIGHBOR_STATUS
+    init_local_neighbor_status();
+#endif
     
     // Initialize mesh
     init_mesh();
+
+#if ENABLE_BEACON_NEIGHBOR_DISCOVERY
+    init_beacon_monitoring();
+    start_beacon_scanning();
+#endif
     
     // Initialize UDP socket
     init_udp();
@@ -590,6 +591,7 @@ extern "C" void app_main(void)
 #if ENABLE_WIFI_NEIGHBOR_SCAN
     uint32_t last_neighbor_scan = 0;
 #endif
+    uint32_t last_neighbor_cleanup = 0;
     uint32_t last_visualization_update = 0;
     node_state_t last_published_state = {};
     bool has_published_state = false;
@@ -616,15 +618,28 @@ extern "C" void app_main(void)
                 last_published_state = node_state;
                 has_published_state = true;
                 mesh_status_publish_requested = false;
-                send_state_to_neighbors();
+#if ENABLE_LOCAL_NEIGHBOR_STATUS
+                send_local_status_to_neighbors();
+#endif
+                if (mesh_initialized && esp_mesh_get_layer() > 0) {
+                    send_state_to_neighbors();
+                }
 #if ENABLE_MQTT_VISUALIZATION
                 if (esp_mesh_is_root() && is_mqtt_connected()) {
-                    mqtt_publish_topology_and_state();
+                    if (periodic_due || publish_requested) {
+                        mqtt_publish_topology();
+                    }
+                    mqtt_publish_state();
                 }
 #endif
             }
         }
         
+        // Passive beacon neighbor discovery is independent of mesh attachment.
+#if ENABLE_BEACON_NEIGHBOR_DISCOVERY
+        update_beacon_monitoring();
+#endif
+
         // Trigger neighbor discovery
 #if ENABLE_WIFI_NEIGHBOR_SCAN
         if (mesh_initialized && esp_mesh_get_layer() > 0 && now - last_neighbor_scan >= BEACON_SCAN_INTERVAL) {
@@ -633,6 +648,11 @@ extern "C" void app_main(void)
             cleanup_inactive_neighbors();
         }
 #endif
+
+        if (now - last_neighbor_cleanup >= 1000) {
+            last_neighbor_cleanup = now;
+            cleanup_inactive_neighbors();
+        }
         
         // Send updates to visualization server
         bool can_send_to_viz = has_ip_address() || esp_mesh_is_root();

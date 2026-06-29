@@ -44,6 +44,26 @@ static bool parse_string_field(const char *json, const char *field, char *out, s
     return i > 0;
 }
 
+static bool parse_mac_string(const char *mac_str, uint8_t *mac) {
+    if (mac_str == NULL || mac == NULL) {
+        return false;
+    }
+
+    unsigned int values[6] = {};
+    if (sscanf(mac_str, "%02x:%02x:%02x:%02x:%02x:%02x",
+               &values[0], &values[1], &values[2],
+               &values[3], &values[4], &values[5]) != 6) {
+        return false;
+    }
+
+    for (int i = 0; i < 6; i++) {
+        if (values[i] > 0xFF) return false;
+        mac[i] = (uint8_t)values[i];
+    }
+
+    return true;
+}
+
 static bool parse_number_field(const char *json, const char *field, float *out) {
     char needle[32];
     snprintf(needle, sizeof(needle), "\"%s\"", field);
@@ -159,21 +179,53 @@ static void handle_mqtt_command(const char *payload, int len) {
     char *json = (char *)calloc((size_t)len + 1, 1);
     if (!json) return;
     memcpy(json, payload, len);
+    bool config_changed = false;
+
+    char command[32];
+    char target_mac_str[18];
+    uint8_t target_mac[6] = {};
+    bool has_command = parse_string_field(json, "command", command, sizeof(command));
+    if (has_command &&
+        strcmp(command, "toggle") == 0 &&
+        parse_string_field(json, "target_mac", target_mac_str, sizeof(target_mac_str)) &&
+        parse_mac_string(target_mac_str, target_mac)) {
+        send_mesh_toggle_command(target_mac);
+        free(json);
+        return;
+    }
+
+    if (has_command &&
+        strcmp(command, "highlight") == 0 &&
+        parse_string_field(json, "target_mac", target_mac_str, sizeof(target_mac_str)) &&
+        parse_mac_string(target_mac_str, target_mac)) {
+        bool enabled = parse_bool_field(json, "enabled");
+        send_mesh_highlight_command(target_mac, enabled);
+        free(json);
+        return;
+    }
+
+    if (parse_bool_field(json, "toggle") &&
+        parse_string_field(json, "target_mac", target_mac_str, sizeof(target_mac_str)) &&
+        parse_mac_string(target_mac_str, target_mac)) {
+        send_mesh_toggle_command(target_mac);
+        free(json);
+        return;
+    }
 
     char preset[32];
     if (parse_string_field(json, "preset", preset, sizeof(preset))) {
-        load_preset(preset);
+        config_changed = load_preset(preset) || config_changed;
     }
 
     float kernel[KERNEL_SIZE];
     if (parse_float_array_field(json, "kernel", kernel, KERNEL_SIZE)) {
-        set_kernel_values(kernel);
+        config_changed = set_kernel_values(kernel) || config_changed;
     }
 
     activation_rule_t rules[MAX_ACTIVATIONS] = {};
     uint8_t count = 0;
     if (parse_activations_field(json, rules, &count)) {
-        set_activation_rules(rules, count);
+        config_changed = set_activation_rules(rules, count) || config_changed;
     }
 
     float value = 0.0f;
@@ -184,6 +236,13 @@ static void handle_mqtt_command(const char *payload, int len) {
 
     if (parse_bool_field(json, "reset")) {
         reset_state_value();
+        config_changed = true;
+    }
+
+    if (config_changed) {
+        broadcast_state();
+        send_local_status_to_neighbors();
+        mqtt_publish_topology_and_state();
     }
 
     free(json);
@@ -309,7 +368,40 @@ static void format_activations_json(const node_state_t *state, char *activations
     }
 }
 
-void mqtt_publish_node_state(const uint8_t *node_mac_value, const node_state_t *state) {
+static int format_neighbors_json(const neighbor_info_t *neighbors, int max_neighbors,
+                                 char *out, size_t out_len) {
+    size_t offset = 0;
+    bool first = true;
+    int active_count = 0;
+
+    offset += snprintf(out + offset, out_len - offset, "[");
+    if (neighbors != NULL) {
+        for (int i = 0; i < max_neighbors &&
+                        i < MAX_NEIGHBORS &&
+                        offset < out_len; i++) {
+            if (!neighbors[i].active) continue;
+
+            char neighbor_mac[18];
+            snprintf(neighbor_mac, sizeof(neighbor_mac), MACSTR, MAC2STR(neighbors[i].mac));
+            offset += snprintf(out + offset, out_len - offset,
+                               "%s{\"mac\":\"%s\",\"rssi\":%d,\"last_seen\":%lu,\"value\":%u}",
+                               first ? "" : ",",
+                               neighbor_mac,
+                               neighbors[i].rssi,
+                               (unsigned long)neighbors[i].last_seen,
+                               neighbors[i].has_state ? neighbors[i].state.value : 0);
+            first = false;
+            active_count++;
+        }
+    }
+    if (offset < out_len) {
+        snprintf(out + offset, out_len - offset, "]");
+    }
+    return active_count;
+}
+
+void mqtt_publish_node_state_with_neighbors(const uint8_t *node_mac_value, const node_state_t *state,
+                                            const neighbor_info_t *neighbors, int max_neighbors) {
     if (!mqtt_connected || mqtt_client == NULL) {
         return;
     }
@@ -320,11 +412,13 @@ void mqtt_publish_node_state(const uint8_t *node_mac_value, const node_state_t *
     char mac[18];
     char *kernel = (char *)calloc(192, 1);
     char *activations = (char *)calloc(256, 1);
-    char *payload = (char *)calloc(1024, 1);
-    if (kernel == NULL || activations == NULL || payload == NULL) {
+    char *neighbors_json = (char *)calloc(768, 1);
+    char *payload = (char *)calloc(2200, 1);
+    if (kernel == NULL || activations == NULL || neighbors_json == NULL || payload == NULL) {
         ESP_LOGW(TAG, "Skipping MQTT state publish: allocation failed");
         free(kernel);
         free(activations);
+        free(neighbors_json);
         free(payload);
         return;
     }
@@ -332,8 +426,9 @@ void mqtt_publish_node_state(const uint8_t *node_mac_value, const node_state_t *
     snprintf(mac, sizeof(mac), MACSTR, MAC2STR(node_mac_value));
     format_kernel_json(state, kernel, 192);
     format_activations_json(state, activations, 256);
+    int active_neighbor_count = format_neighbors_json(neighbors, max_neighbors, neighbors_json, 768);
 
-    snprintf(payload, 1024,
+    snprintf(payload, 2200,
              "{\"mac\":\"%s\",\"state\":%u,\"temperature\":%d,"
              "\"mmwave_presence\":%u,\"mmwave_distance\":%lu,\"timestamp\":%lu,"
              "\"value\":%u,\"activation_sum\":%.4f,"
@@ -341,6 +436,7 @@ void mqtt_publish_node_state(const uint8_t *node_mac_value, const node_state_t *
              "\"kernel_sequence\":%lu,\"value_sequence\":%lu,"
              "\"activation_sequence\":%lu,\"activation_count\":%u,"
              "\"kernel\":%s,\"activations\":%s,"
+             "\"neighbor_count\":%d,\"neighbors\":%s,"
              "\"color\":[%u,%u,%u]}",
              mac, state->state, state->temperature,
              state->mmwave_presence, (unsigned long)state->mmwave_distance,
@@ -351,16 +447,22 @@ void mqtt_publish_node_state(const uint8_t *node_mac_value, const node_state_t *
              (unsigned long)state->value_sequence,
              (unsigned long)state->activation_sequence,
              state->activation_count, kernel, activations,
+             active_neighbor_count, neighbors_json,
              state->color[0], state->color[1], state->color[2]);
 
     esp_mqtt_client_publish(mqtt_client, MQTT_STATE_TOPIC, payload, 0, 0, 0);
     free(kernel);
     free(activations);
+    free(neighbors_json);
     free(payload);
 }
 
+void mqtt_publish_node_state(const uint8_t *node_mac_value, const node_state_t *state) {
+    mqtt_publish_node_state_with_neighbors(node_mac_value, state, NULL, 0);
+}
+
 void mqtt_publish_state(void) {
-    mqtt_publish_node_state(node_mac, &node_state);
+    mqtt_publish_node_state_with_neighbors(node_mac, &node_state, neighbor_list, MAX_NEIGHBORS);
 }
 
 void mqtt_publish_topology_and_state(void) {

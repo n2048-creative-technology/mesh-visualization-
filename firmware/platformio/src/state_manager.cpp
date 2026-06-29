@@ -19,8 +19,10 @@ static const char *TAG = "STATE_MANAGER";
 bool sensors_initialized = false;
 node_state_t node_state;
 float currentBrightness = 0.0f;
+static bool led_highlight_enabled = false;
 
 static uint32_t lastTempReadMs = 0;
+static uint32_t manual_value_hold_until_ms = 0;
 static led_strip_handle_t led_strip = NULL;
 
 static char kernel_function[64] = "random";
@@ -184,12 +186,30 @@ void set_led_color(uint8_t r, uint8_t g, uint8_t b) {
 }
 
 void update_led_color(void) {
+    if (led_highlight_enabled) {
+        currentBrightness = 255.0f;
+        set_led_color(255, 0, 0);
+        return;
+    }
+
     float targetBrightness = node_state.value ? 255.0f : 0.0f;
     currentBrightness += (targetBrightness - currentBrightness) * TRANSITION_SPEED;
     currentBrightness = CLAMP(currentBrightness, 0.0f, 255.0f);
 
     uint8_t smoothed = (uint8_t)currentBrightness;
     set_led_color(smoothed, smoothed, smoothed);
+}
+
+void set_led_highlight(bool enabled) {
+    led_highlight_enabled = enabled;
+    if (enabled) {
+        currentBrightness = 255.0f;
+        set_led_color(255, 0, 0);
+    } else {
+        currentBrightness = node_state.value ? 255.0f : 0.0f;
+        uint8_t restored = (uint8_t)currentBrightness;
+        set_led_color(restored, restored, restored);
+    }
 }
 
 bool set_kernel_values(const float values[KERNEL_SIZE]) {
@@ -245,6 +265,20 @@ void reset_state_value(void) {
     node_state.state = node_state.value ? NODE_STATE_ACTIVE : NODE_STATE_IDLE;
     ESP_LOGI(TAG, "Value reset to %u, vseq=%lu",
              node_state.value, (unsigned long)node_state.value_sequence);
+}
+
+void set_state_value(uint8_t value) {
+    node_state.value = value ? 1 : 0;
+    node_state.value_sequence++;
+    node_state.state = node_state.value ? NODE_STATE_ACTIVE : NODE_STATE_IDLE;
+    manual_value_hold_until_ms = (uint32_t)(esp_timer_get_time() / 1000) + COMMAND_VALUE_HOLD_MS;
+    update_led_color();
+    ESP_LOGI(TAG, "Value set to %u, vseq=%lu",
+             node_state.value, (unsigned long)node_state.value_sequence);
+}
+
+void toggle_state_value(void) {
+    set_state_value(node_state.value ? 0 : 1);
 }
 
 void adopt_neighbor_rules(const node_state_t *neighbor_state) {
@@ -336,8 +370,15 @@ void init_state(void) {
 void update_state(void) {
     if (!sensors_initialized) return;
     read_sensors();
+    uint32_t now = esp_timer_get_time() / 1000;
+    if (manual_value_hold_until_ms != 0 && now < manual_value_hold_until_ms) {
+        node_state.state = node_state.value ? NODE_STATE_ACTIVE : NODE_STATE_IDLE;
+        node_state.timestamp = now;
+        return;
+    }
+    manual_value_hold_until_ms = 0;
     apply_activation_function();
-    node_state.timestamp = esp_timer_get_time() / 1000;
+    node_state.timestamp = now;
 }
 
 void set_kernel_function(const char *kernel) {

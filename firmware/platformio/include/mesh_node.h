@@ -52,6 +52,30 @@ typedef struct {
     uint16_t checksum;
 } mesh_message_t;
 
+typedef struct {
+    uint8_t version;
+    uint8_t msg_type;
+    uint8_t target_mac[6];
+    uint8_t command;
+    uint8_t value;
+    uint32_t sequence;
+    uint16_t checksum;
+} mesh_command_t;
+
+typedef struct {
+    uint8_t version;
+    uint8_t msg_type;
+    uint8_t mac[6];
+    uint8_t state;
+    uint8_t value;
+    int16_t temperature;
+    uint8_t mmwave_presence;
+    uint32_t mmwave_distance;
+    uint32_t timestamp;
+    uint32_t value_sequence;
+    uint16_t checksum;
+} local_status_message_t;
+
 // Function Declarations
 void init_mesh(void);
 void init_wifi(void);
@@ -69,6 +93,10 @@ void set_node_state(uint8_t state);
 void set_led_color(uint8_t r, uint8_t g, uint8_t b);
 void read_sensors(void);
 void send_state_to_neighbors(void);
+void init_local_neighbor_status(void);
+void send_local_status_to_neighbors(void);
+void send_mesh_toggle_command(const uint8_t *target_mac);
+void send_mesh_highlight_command(const uint8_t *target_mac, bool enabled);
 void forward_to_visualization(mesh_message_t *msg);
 void broadcast_state(void);
 void send_udp_message(uint8_t *dest_ip, uint16_t dest_port, mesh_message_t *msg);

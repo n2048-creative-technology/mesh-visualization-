@@ -14,6 +14,7 @@
 #include "esp_mac.h"
 #include "esp_timer.h"
 #include "esp_mesh.h"
+#include "esp_now.h"
 #include "lwip/sockets.h"
 #include "lwip/netdb.h"
 #include "lwip/inet.h"
@@ -40,8 +41,17 @@ static uint32_t message_sequence = 0;
 static const uint8_t mesh_id[6] = {0x47, 0x4c, 0x4f, 0x57, 0x20, 0x01};
 static bool mesh_stack_initialized = false;
 static bool mesh_rx_task_started = false;
+static bool local_status_initialized = false;
+static const uint8_t broadcast_mac[6] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
 
 static void mesh_receive_task(void *arg);
+static uint16_t calculate_command_checksum(const mesh_command_t *cmd);
+static bool verify_command_checksum(const mesh_command_t *cmd);
+static void apply_mesh_command(const mesh_command_t *cmd);
+static void send_mesh_command_to_node(const uint8_t *target_mac, uint8_t command, uint8_t value);
+static uint16_t calculate_local_status_checksum(const local_status_message_t *msg);
+static bool verify_local_status_checksum(const local_status_message_t *msg);
+static void local_status_recv_callback(const esp_now_recv_info_t *info, const uint8_t *data, int len);
 
 /**
  * Platform-specific initialization
@@ -509,15 +519,15 @@ bool verify_checksum(mesh_message_t *msg) {
 static void mesh_receive_task(void *arg) {
     mesh_addr_t from;
     mesh_message_t msg;
+    mesh_command_t cmd;
     mesh_data_t data;
     int flag = 0;
-
-    data.data = (uint8_t *)&msg;
-    data.size = sizeof(msg);
 
     while (true) {
         memset(&from, 0, sizeof(from));
         memset(&msg, 0, sizeof(msg));
+        memset(&cmd, 0, sizeof(cmd));
+        data.data = (uint8_t *)&msg;
         data.size = sizeof(msg);
 
         esp_err_t err = esp_mesh_recv(&from, &data, pdMS_TO_TICKS(1000), &flag, NULL, 0);
@@ -527,6 +537,20 @@ static void mesh_receive_task(void *arg) {
         if (err != ESP_OK) {
             ESP_LOGD(TAG, "esp_mesh_recv failed: %s", esp_err_to_name(err));
             vTaskDelay(pdMS_TO_TICKS(250));
+            continue;
+        }
+        if (data.size == sizeof(mesh_command_t)) {
+            memcpy(&cmd, &msg, sizeof(cmd));
+            if (cmd.version != PROTOCOL_VERSION || cmd.msg_type != MSG_TYPE_COMMAND) {
+                ESP_LOGW(TAG, "Ignoring unsupported mesh command version=%u type=%u",
+                         cmd.version, cmd.msg_type);
+                continue;
+            }
+            if (!verify_command_checksum(&cmd)) {
+                ESP_LOGW(TAG, "Ignoring mesh command with invalid checksum");
+                continue;
+            }
+            apply_mesh_command(&cmd);
             continue;
         }
         if (data.size != sizeof(mesh_message_t)) {
@@ -544,20 +568,242 @@ static void mesh_receive_task(void *arg) {
             continue;
         }
 
-        update_neighbor_list(msg.mac, -50);
-        neighbor_info_t *neighbor = get_neighbor_by_mac(msg.mac);
-        if (neighbor) {
-            neighbor->state = msg.state;
-            neighbor->has_state = true;
-            neighbor->last_seen = esp_timer_get_time() / 1000;
-        }
-
         adopt_neighbor_rules(&msg.state);
 
         if (esp_mesh_is_root()) {
-            mqtt_publish_node_state(msg.mac, &msg.state);
+            mqtt_publish_node_state_with_neighbors(msg.mac, &msg.state, msg.neighbors, MAX_NEIGHBORS);
             forward_to_visualization(&msg);
         }
+    }
+}
+
+static uint16_t calculate_command_checksum(const mesh_command_t *cmd) {
+    uint16_t checksum = 0;
+    const uint8_t *data = (const uint8_t *)cmd;
+    size_t len = offsetof(mesh_command_t, checksum);
+
+    for (size_t i = 0; i < len; i++) {
+        checksum += data[i];
+    }
+
+    return checksum;
+}
+
+static bool verify_command_checksum(const mesh_command_t *cmd) {
+    return cmd != NULL && calculate_command_checksum(cmd) == cmd->checksum;
+}
+
+static void apply_mesh_command(const mesh_command_t *cmd) {
+    if (cmd == NULL || memcmp(cmd->target_mac, node_mac, sizeof(node_mac)) != 0) {
+        return;
+    }
+
+    switch (cmd->command) {
+        case MESH_COMMAND_TOGGLE_VALUE:
+            toggle_state_value();
+            send_state_to_neighbors();
+            break;
+
+        case MESH_COMMAND_HIGHLIGHT_ON:
+            set_led_highlight(true);
+            break;
+
+        case MESH_COMMAND_HIGHLIGHT_OFF:
+            set_led_highlight(false);
+            break;
+
+        default:
+            ESP_LOGW(TAG, "Ignoring unknown mesh command: %u", cmd->command);
+            break;
+    }
+}
+
+static uint16_t calculate_local_status_checksum(const local_status_message_t *msg) {
+    uint16_t checksum = 0;
+    const uint8_t *data = (const uint8_t *)msg;
+    size_t len = offsetof(local_status_message_t, checksum);
+
+    for (size_t i = 0; i < len; i++) {
+        checksum += data[i];
+    }
+
+    return checksum;
+}
+
+static bool verify_local_status_checksum(const local_status_message_t *msg) {
+    return msg != NULL && calculate_local_status_checksum(msg) == msg->checksum;
+}
+
+static void local_status_recv_callback(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
+#if ENABLE_LOCAL_NEIGHBOR_STATUS
+    if (info == NULL || data == NULL || len != sizeof(local_status_message_t)) {
+        return;
+    }
+
+    local_status_message_t msg = {};
+    memcpy(&msg, data, sizeof(msg));
+
+    if (msg.version != PROTOCOL_VERSION || msg.msg_type != MSG_TYPE_STATE_UPDATE) {
+        return;
+    }
+    if (!verify_local_status_checksum(&msg)) {
+        return;
+    }
+    if (memcmp(msg.mac, node_mac, sizeof(node_mac)) == 0) {
+        return;
+    }
+
+    int8_t rssi = -50;
+    if (info->rx_ctrl != NULL) {
+        rssi = info->rx_ctrl->rssi;
+    }
+
+    update_neighbor_list(msg.mac, rssi);
+    neighbor_info_t *neighbor = get_neighbor_by_mac(msg.mac);
+    if (neighbor == NULL) {
+        return;
+    }
+
+    neighbor->state.state = msg.state;
+    neighbor->state.value = msg.value;
+    neighbor->state.temperature = msg.temperature;
+    neighbor->state.mmwave_presence = msg.mmwave_presence;
+    neighbor->state.mmwave_distance = msg.mmwave_distance;
+    neighbor->state.timestamp = msg.timestamp;
+    neighbor->state.value_sequence = msg.value_sequence;
+    neighbor->has_state = true;
+    neighbor->last_seen = esp_timer_get_time() / 1000;
+#endif
+}
+
+void init_local_neighbor_status(void) {
+#if ENABLE_LOCAL_NEIGHBOR_STATUS
+    if (local_status_initialized) {
+        return;
+    }
+
+    esp_err_t err = esp_now_init();
+    if (err != ESP_OK && err != ESP_ERR_ESPNOW_INTERNAL) {
+        ESP_LOGW(TAG, "Failed to initialize ESP-NOW local status: %s", esp_err_to_name(err));
+        return;
+    }
+
+    err = esp_now_register_recv_cb(local_status_recv_callback);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to register ESP-NOW receive callback: %s", esp_err_to_name(err));
+        return;
+    }
+
+    if (!esp_now_is_peer_exist(broadcast_mac)) {
+        esp_now_peer_info_t peer = {};
+        memcpy(peer.peer_addr, broadcast_mac, sizeof(peer.peer_addr));
+        peer.channel = 0;
+        peer.ifidx = WIFI_IF_STA;
+        peer.encrypt = false;
+
+        err = esp_now_add_peer(&peer);
+        if (err != ESP_OK && err != ESP_ERR_ESPNOW_EXIST) {
+            ESP_LOGW(TAG, "Failed to add ESP-NOW broadcast peer: %s", esp_err_to_name(err));
+            return;
+        }
+    }
+
+    local_status_initialized = true;
+    ESP_LOGI(TAG, "Local ESP-NOW neighbor status initialized");
+#endif
+}
+
+void send_local_status_to_neighbors(void) {
+#if ENABLE_LOCAL_NEIGHBOR_STATUS
+    if (!local_status_initialized) {
+        init_local_neighbor_status();
+    }
+    if (!local_status_initialized) {
+        return;
+    }
+
+    local_status_message_t msg = {};
+    msg.version = PROTOCOL_VERSION;
+    msg.msg_type = MSG_TYPE_STATE_UPDATE;
+    memcpy(msg.mac, node_mac, sizeof(msg.mac));
+    msg.state = node_state.state;
+    msg.value = node_state.value;
+    msg.temperature = node_state.temperature;
+    msg.mmwave_presence = node_state.mmwave_presence;
+    msg.mmwave_distance = node_state.mmwave_distance;
+    msg.timestamp = node_state.timestamp;
+    msg.value_sequence = node_state.value_sequence;
+    msg.checksum = calculate_local_status_checksum(&msg);
+
+    esp_err_t err = esp_now_send(broadcast_mac, (const uint8_t *)&msg, sizeof(msg));
+    if (err != ESP_OK) {
+        ESP_LOGD(TAG, "ESP-NOW local status send failed: %s", esp_err_to_name(err));
+    }
+#endif
+}
+
+void send_mesh_toggle_command(const uint8_t *target_mac) {
+    send_mesh_command_to_node(target_mac, MESH_COMMAND_TOGGLE_VALUE, 0);
+}
+
+void send_mesh_highlight_command(const uint8_t *target_mac, bool enabled) {
+    send_mesh_command_to_node(target_mac,
+                              enabled ? MESH_COMMAND_HIGHLIGHT_ON : MESH_COMMAND_HIGHLIGHT_OFF,
+                              enabled ? 1 : 0);
+}
+
+static void send_mesh_command_to_node(const uint8_t *target_mac, uint8_t command, uint8_t value) {
+    if (target_mac == NULL) {
+        return;
+    }
+
+    if (memcmp(target_mac, node_mac, sizeof(node_mac)) == 0) {
+        switch (command) {
+            case MESH_COMMAND_TOGGLE_VALUE:
+                toggle_state_value();
+                send_state_to_neighbors();
+                break;
+            case MESH_COMMAND_HIGHLIGHT_ON:
+                set_led_highlight(true);
+                break;
+            case MESH_COMMAND_HIGHLIGHT_OFF:
+                set_led_highlight(false);
+                break;
+            default:
+                break;
+        }
+        return;
+    }
+
+    if (!mesh_initialized || !esp_mesh_is_root()) {
+        ESP_LOGW(TAG, "Only the active mesh root can route targeted commands");
+        return;
+    }
+
+    mesh_command_t cmd = {};
+    cmd.version = PROTOCOL_VERSION;
+    cmd.msg_type = MSG_TYPE_COMMAND;
+    memcpy(cmd.target_mac, target_mac, sizeof(cmd.target_mac));
+    cmd.command = command;
+    cmd.value = value;
+    cmd.sequence = message_sequence++;
+    cmd.checksum = calculate_command_checksum(&cmd);
+
+    mesh_addr_t dest_addr = {};
+    memcpy(dest_addr.addr, target_mac, sizeof(dest_addr.addr));
+
+    mesh_data_t mesh_data = {};
+    mesh_data.data = (uint8_t *)&cmd;
+    mesh_data.size = sizeof(cmd);
+    mesh_data.proto = MESH_PROTO_BIN;
+    mesh_data.tos = MESH_TOS_P2P;
+
+    esp_err_t err = esp_mesh_send(&dest_addr, &mesh_data, MESH_DATA_P2P, NULL, 0);
+    if (err == ESP_OK) {
+        ESP_LOGD(TAG, "Mesh command %u sent to " MACSTR, command, MAC2STR(target_mac));
+    } else {
+        ESP_LOGW(TAG, "Failed to send mesh command %u to " MACSTR ": %s",
+                 command, MAC2STR(target_mac), esp_err_to_name(err));
     }
 }
 
@@ -625,25 +871,8 @@ void send_state_to_neighbors(void) {
         }
         return;
     }
-    
-    // Send to each active neighbor
-    for (int i = 0; i < MAX_NEIGHBORS; i++) {
-        if (neighbor_list[i].active) {
-            // Use mesh API to send data
-            mesh_addr_t dest_addr;
-            memcpy(dest_addr.addr, neighbor_list[i].mac, 6);
 
-            esp_err_t err = esp_mesh_send(&dest_addr, &mesh_data, 
-                                         MESH_DATA_P2P, NULL, 0);
-            
-            if (err == ESP_OK) {
-                ESP_LOGD(TAG, "State sent to neighbor " MACSTR, MAC2STR(neighbor_list[i].mac));
-            } else {
-                ESP_LOGW(TAG, "Failed to send to neighbor " MACSTR ": %s", 
-                         MAC2STR(neighbor_list[i].mac), esp_err_to_name(err));
-            }
-        }
-    }
+    ESP_LOGD(TAG, "Root keeps state locally; child/root publication is handled by MQTT/UDP bridge");
 }
 
 /**
@@ -652,6 +881,10 @@ void send_state_to_neighbors(void) {
 void broadcast_state(void) {
     if (!mesh_initialized) {
         ESP_LOGW(TAG, "Mesh not initialized, cannot broadcast");
+        return;
+    }
+    if (!esp_mesh_is_root()) {
+        send_state_to_neighbors();
         return;
     }
     
@@ -694,16 +927,46 @@ void broadcast_state(void) {
     mesh_data.data = (uint8_t*)&msg;
     mesh_data.size = sizeof(mesh_message_t);
     mesh_data.proto = MESH_PROTO_BIN; // Binary protocol
-    
-    // For broadcast, use NULL as destination
-    esp_err_t err = esp_mesh_send(NULL, &mesh_data, 
-                                 MESH_DATA_P2P, NULL, 0);
-    
-    if (err == ESP_OK) {
-        ESP_LOGD(TAG, "State broadcast to all nodes");
-    } else {
-        ESP_LOGW(TAG, "Failed to broadcast state: %s", esp_err_to_name(err));
+
+    int rtable_size = esp_mesh_get_routing_table_size();
+    if (rtable_size <= 0) {
+        ESP_LOGD(TAG, "No mesh routes available for broadcast");
+        return;
     }
+
+    mesh_addr_t *route_table = (mesh_addr_t *)calloc((size_t)rtable_size, sizeof(mesh_addr_t));
+    if (route_table == NULL) {
+        ESP_LOGW(TAG, "Failed to allocate routing table for broadcast");
+        return;
+    }
+
+    int route_count = 0;
+    esp_err_t err = esp_mesh_get_routing_table(route_table,
+                                               rtable_size * sizeof(mesh_addr_t),
+                                               &route_count);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to read routing table for broadcast: %s", esp_err_to_name(err));
+        free(route_table);
+        return;
+    }
+
+    int sent = 0;
+    for (int i = 0; i < route_count; i++) {
+        if (memcmp(route_table[i].addr, node_mac, sizeof(node_mac)) == 0) {
+            continue;
+        }
+
+        err = esp_mesh_send(&route_table[i], &mesh_data, MESH_DATA_P2P, NULL, 0);
+        if (err == ESP_OK) {
+            sent++;
+        } else {
+            ESP_LOGD(TAG, "Failed broadcast state to " MACSTR ": %s",
+                     MAC2STR(route_table[i].addr), esp_err_to_name(err));
+        }
+    }
+
+    ESP_LOGI(TAG, "Broadcast state/config to %d/%d mesh routes", sent, route_count);
+    free(route_table);
 }
 
 /**

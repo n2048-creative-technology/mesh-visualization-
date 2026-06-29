@@ -12,6 +12,7 @@ The current implementation uses Espressif ESP-WiFi-Mesh on Seeed XIAO ESP32-C3 b
 - The root republishes every node state on `mesh/state`.
 - The root publishes bounded topology summaries on `mesh/topology`.
 - Nodes keep trying to reconnect through explicit ESP-WiFi-Mesh self-organization plus a firmware watchdog. Temporary distance, interference, weak power, or router/MQTT outages should recover without manual resets once radio/power conditions improve.
+- Local neighbor discovery does not require the mesh or router: passive beacon RSSI updates the bounded neighbor list, and ESP-NOW broadcasts compact status to nearby nodes.
 - If NVS is corrupt or stale, firmware recovers the NVS partition; if Wi-Fi returns a zero MAC, the node erases NVS and restarts.
 - LED color is computed from the node value/activation state. LED fade changes are included in state JSON but do not trigger extra MQTT publishes by themselves.
 
@@ -88,11 +89,12 @@ Important settings live in `firmware/platformio/include/config.h` and can be ove
 | `MESH_MAX_HOPS` | Maximum mesh depth |
 | `MESH_AP_CONNECTIONS` | Child capacity per mesh AP |
 | `MAX_NEIGHBORS` | Local activation/topology sample size, not total mesh size |
+| `ENABLE_BEACON_NEIGHBOR_DISCOVERY` | Passive beacon RSSI neighbor discovery, independent of mesh |
+| `ENABLE_LOCAL_NEIGHBOR_STATUS` | ESP-NOW local status broadcast/receive, independent of mesh |
 | `MQTT_UPDATE_INTERVAL_MS` | 5-second state heartbeat |
 | `MESH_HEALTH_CHECK_INTERVAL_MS` | Watchdog check interval |
 | `MESH_RECONNECT_ATTEMPT_MS` | Detached duration before explicitly requesting a mesh reconnect |
 | `MESH_RECONNECT_RESTART_MS` | Detached duration before mesh stack restart |
-| `MESH_ROOT_IP_RECOVERY_MS` | Root grace period before forcing router-side recovery |
 | `MESH_AP_ASSOC_EXPIRE_SECONDS` | Parent keeps a quiet child associated for this many seconds |
 | `MQTT_TOPOLOGY_ROUTE_SAMPLE_LIMIT` | Bounded routing-table sample size in MQTT JSON |
 
@@ -159,10 +161,11 @@ The root subscribes to the global command topic and its node-specific command to
 - `activations`
 - `value`
 - `reset`
+- `command: "toggle"` with `target_mac`
 
 ## Visualization Behavior
 
-The Node.js server stores node state in memory, serves `/api/nodes`, `/api/topology`, `/api/stats`, and broadcasts browser updates via WebSocket. MQTT topology references now create placeholder nodes immediately, so a node discovered in the routing table can appear before its first full state frame arrives. Stale nodes are removed after `STALE_NODE_TIMEOUT_MS`, defaulting to 30 seconds.
+The Node.js server stores node state in memory, serves `/api/nodes`, `/api/topology`, `/api/stats`, and broadcasts browser updates via WebSocket. Nodes are always colored by LED/value status: green means LED on and red means LED off. Each node renders a transparent floating detail label with status, state, value sequence, temperature, mmWave presence/distance, neighbor count/RSSI, and kernel/activation metadata. Clicking a node sends a targeted MQTT toggle command for that MAC; the mesh root forwards it to the node, which toggles its activation value and LED. The Configure tab edits a 9-value kernel and activation rules for all nodes via `mesh/commands`. MQTT topology references now create placeholder nodes immediately, so a node discovered in the routing table can appear before its first full state frame arrives. Stale nodes are removed after `STALE_NODE_TIMEOUT_MS`, defaulting to 30 seconds. Topology rearrangement preserves node physics state and uses lower force alpha for smoother interpolation.
 
 ## Troubleshooting
 

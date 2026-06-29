@@ -10,59 +10,26 @@
 const WS_URL = `ws://${window.location.hostname}:${window.location.port}`;
 const UPDATE_INTERVAL = 100; // ms
 
-// Color schemes
-const COLOR_SCHEMES = {
-    rssi: {
-        name: 'By RSSI Strength',
-        node: (node) => {
-            // Use average neighbor RSSI for node color
-            if (node.neighbors.length === 0) return '#888888';
-            const avgRssi = node.neighbors.reduce((sum, n) => sum + n.rssi, 0) / node.neighbors.length;
-            return rssiToColor(avgRssi);
-        },
-        link: (rssi) => rssiToColor(rssi)
-    },
-    state: {
-        name: 'By Node State',
-        node: (node) => {
-            switch (node.state) {
-                case 0: return '#0000ff'; // Idle
-                case 1: return '#00ff00'; // Active
-                case 2: return '#ff0000'; // Error
-                case 3: return '#ffff00'; // Booting
-                default: return '#888888';
-            }
-        },
-        link: () => '#666666'
-    },
-    temperature: {
-        name: 'By Temperature',
-        node: (node) => temperatureToColor(node.temperature),
-        link: () => '#666666'
-    },
-    fixed: {
-        name: 'Fixed Color',
-        node: () => '#4a90e2',
-        link: () => '#666666'
-    }
-};
-
 // ============================================================================
 // Global Variables
 // ============================================================================
 
 let nodes = {};
 let links = [];
-let svg, simulation, nodeElements, linkElements, labelElements, rssiElements;
+let svg, viewport, zoomBehavior, simulation, nodeElements, linkElements, labelElements, rssiElements, detailElements;
 let ws;
 let isPaused = false;
 let isConnected = false;
 let mqttConnected = false;
 let latestServerStats = null;
-let colorScheme = 'rssi';
+let activeTab = 'topology';
 let showLabels = true;
 let showRssi = true;
 let minRssi = -80;
+let selectedNodeMac = null;
+let highlightedNodeMac = null;
+let nodeCommandStatus = '';
+let configStatus = '';
 
 // ============================================================================
 // Utility Functions
@@ -87,33 +54,19 @@ function rssiToColor(rssi) {
 }
 
 /**
- * Convert temperature to color (blue = cold, red = hot)
- */
-function temperatureToColor(temp) {
-    // Assume temperature range of -20°C to 50°C
-    const clamped = Math.max(-20, Math.min(50, temp));
-    const normalized = (clamped + 20) / 70;
-    
-    // Blue to red gradient
-    const r = Math.floor(255 * normalized);
-    const g = 0;
-    const b = Math.floor(255 * (1 - normalized));
-    
-    return `rgb(${r}, ${g}, ${b})`;
-}
-
-/**
- * Get node color based on current scheme
+ * Get node color from LED/value status.
  */
 function getNodeColor(node) {
-    return COLOR_SCHEMES[colorScheme].node(node);
+    if (node.value === 1) return '#00ff00';
+    if (node.value === 0) return '#ff0000';
+    return '#888888';
 }
 
 /**
- * Get link color based on current scheme
+ * Get link color from RSSI so signal quality remains readable.
  */
 function getLinkColor(rssi) {
-    return COLOR_SCHEMES[colorScheme].link(rssi);
+    return rssiToColor(rssi);
 }
 
 /**
@@ -124,6 +77,12 @@ function getLinkWidth(rssi) {
     const clamped = Math.max(-100, Math.min(0, rssi));
     const normalized = (clamped + 100) / 100;
     return 1 + 3 * normalized;
+}
+
+function getLinkDistance(rssi) {
+    const clamped = Math.max(-95, Math.min(-25, rssi));
+    const normalized = (clamped + 95) / 70;
+    return 260 - normalized * 170;
 }
 
 /**
@@ -158,6 +117,58 @@ function formatDistance(distance) {
     return `${(distance / 1000).toFixed(2)} m`;
 }
 
+function compactDetail(value, maxLength = 28) {
+    const text = value === undefined || value === null || value === '' ? '?' : String(value);
+    return text.length > maxLength ? `${text.slice(0, maxLength - 3)}...` : text;
+}
+
+function formatNodeDetails(node) {
+    const neighbors = Array.isArray(node.neighbors) ? node.neighbors : [];
+    const avgRssi = neighbors.length > 0
+        ? Math.round(neighbors.reduce((sum, n) => sum + n.rssi, 0) / neighbors.length)
+        : null;
+    const status = node.value === 1 ? 'ON' : node.value === 0 ? 'OFF' : 'WAIT';
+    const kernelSeq = node.kernel_sequence ?? node.kernelSequence ?? '?';
+    const activationSeq = node.activation_sequence ?? node.activationSequence ?? '?';
+    const valueSeq = node.value_sequence ?? node.valueSequence ?? '?';
+    const activationCount = node.activation_count ?? node.activationCount ?? '?';
+    const presence = node.mmwavePresence ? 'yes' : 'no';
+
+    return [
+        `${shortenMac(node.mac)}  ${status}`,
+        `state ${node.state ?? '?'} ${getStateName(node.state)}`,
+        `value ${node.value ?? '?'}  seq ${valueSeq}`,
+        `temp ${formatTemperature(node.temperature)}`,
+        `presence ${presence}  ${formatDistance(node.mmwaveDistance)}`,
+        `neighbors ${neighbors.length}  rssi ${avgRssi === null ? 'N/A' : `${avgRssi} dBm`}`,
+        `kernel ${kernelSeq} ${compactDetail(node.kernel_function)}`,
+        `activation ${activationSeq}/${activationCount} ${compactDetail(node.activation_function)}`
+    ];
+}
+
+function sourceMac(link) {
+    return typeof link.source === 'string' ? link.source : link.source.mac;
+}
+
+function targetMac(link) {
+    return typeof link.target === 'string' ? link.target : link.target.mac;
+}
+
+function mergeNodeData(current, incoming) {
+    if (!current) return incoming;
+
+    const physics = {
+        x: current.x,
+        y: current.y,
+        vx: current.vx,
+        vy: current.vy,
+        fx: current.fx,
+        fy: current.fy
+    };
+
+    return Object.assign(current, incoming, physics);
+}
+
 // ============================================================================
 // D3.js Setup
 // ============================================================================
@@ -167,31 +178,48 @@ function formatDistance(distance) {
  */
 function initVisualization() {
     svg = d3.select('#visualization');
+    viewport = svg.append('g').attr('class', 'viewport');
+    zoomBehavior = d3.zoom()
+        .scaleExtent([0.2, 5])
+        .filter(event => {
+            if (event.type === 'dblclick') return false;
+            return !event.target.closest || !event.target.closest('.node');
+        })
+        .on('zoom', event => {
+            viewport.attr('transform', event.transform);
+        });
+
+    svg.call(zoomBehavior);
+    svg.on('dblclick.zoom', null);
     
     // Create force simulation
     simulation = d3.forceSimulation()
-        .force('link', d3.forceLink().id(d => d.mac).distance(150).strength(0.5))
-        .force('charge', d3.forceManyBody().strength(-300).distanceMax(500))
+        .force('link', d3.forceLink().id(d => d.mac).distance(d => getLinkDistance(d.rssi)).strength(0.55))
+        .force('charge', d3.forceManyBody().strength(-260).distanceMax(500))
         .force('center', d3.forceCenter(window.innerWidth / 2, window.innerHeight / 2 - 100))
         .force('collision', d3.forceCollide().radius(20))
-        .alphaDecay(0.05);
+        .velocityDecay(0.45)
+        .alphaDecay(0.018);
     
     // Create container for links
-    const linkContainer = svg.append('g').attr('class', 'links');
-    
+    const linkContainer = viewport.append('g').attr('class', 'links');
+
+    // Create container for floating node detail cards behind clickable nodes
+    const detailContainer = viewport.append('g').attr('class', 'node-details');
+
     // Create container for nodes
-    const nodeContainer = svg.append('g').attr('class', 'nodes');
+    const nodeContainer = viewport.append('g').attr('class', 'nodes');
     
     // Create container for labels
-    const labelContainer = svg.append('g').attr('class', 'labels');
+    const labelContainer = viewport.append('g').attr('class', 'labels');
     
     // Create container for RSSI labels
-    const rssiContainer = svg.append('g').attr('class', 'rssi-labels');
+    const rssiContainer = viewport.append('g').attr('class', 'rssi-labels');
     
     // Update functions
     function updateLinks() {
         linkElements = linkContainer.selectAll('.link')
-            .data(links, d => `${d.source.mac}-${d.target.mac}`);
+            .data(links, d => `${sourceMac(d)}-${targetMac(d)}`);
         
         // Enter new links
         linkElements.enter()
@@ -212,31 +240,83 @@ function initVisualization() {
     }
     
     function updateNodes() {
-        nodeElements = nodeContainer.selectAll('.node')
+        const nodeSelection = nodeContainer.selectAll('.node')
             .data(Object.values(nodes), d => d.mac);
         
         // Enter new nodes
-        const newNodes = nodeElements.enter()
+        const newNodes = nodeSelection.enter()
             .append('circle')
             .attr('class', 'node')
-            .attr('r', 12)
-            .attr('fill', d => getNodeColor(d))
-            .attr('stroke', '#333')
-            .attr('stroke-width', 2)
-            .on('click', (event, d) => showNodeInfo(d))
-            .on('mouseenter', function() {
-                d3.select(this).attr('r', 16);
+            .on('click', (event, d) => {
+                event.stopPropagation();
+                selectedNodeMac = d.mac;
+                nodeCommandStatus = '';
+                toggleNodeStatus(d);
+                updateVisualization();
             })
-            .on('mouseleave', function() {
-                d3.select(this).attr('r', 12);
+            .on('mouseenter', function(event, d) {
+                startNodeHighlight(d);
+            })
+            .on('mouseleave', function(event, d) {
+                stopNodeHighlight(d);
             });
         
-        // Update existing nodes
-        nodeElements
-            .attr('fill', d => getNodeColor(d));
+        // Update nodes
+        nodeElements = newNodes.merge(nodeSelection)
+            .attr('fill', d => getNodeColor(d))
+            .attr('r', d => d.mac === selectedNodeMac ? 14 : 12)
+            .attr('stroke', d => d.mac === selectedNodeMac ? '#ffffff' : '#333')
+            .attr('stroke-width', d => d.mac === selectedNodeMac ? 4 : 2);
         
         // Remove old nodes
-        nodeElements.exit().remove();
+        nodeSelection.exit().remove();
+    }
+
+    function updateNodeDetails() {
+        if (!showLabels) {
+            if (detailElements) detailElements.remove();
+            return;
+        }
+
+        const nodeData = Object.values(nodes);
+        const detailSelection = detailContainer.selectAll('.node-detail')
+            .data(nodeData, d => d.mac);
+
+        const newDetails = detailSelection.enter()
+            .append('g')
+            .attr('class', 'node-detail');
+
+        newDetails.append('rect')
+            .attr('class', 'node-detail-bg')
+            .attr('rx', 4)
+            .attr('ry', 4);
+
+        detailElements = newDetails.merge(detailSelection);
+        detailElements.each(function(d) {
+            const group = d3.select(this);
+            const lines = formatNodeDetails(d);
+            const textSelection = group.selectAll('text')
+                .data(lines);
+
+            textSelection.enter()
+                .append('text')
+                .attr('class', 'node-detail-text')
+                .merge(textSelection)
+                .attr('x', 8)
+                .attr('y', (_, i) => 14 + i * 12)
+                .text(line => line);
+
+            textSelection.exit().remove();
+
+            const width = Math.max(...lines.map(line => line.length)) * 6 + 16;
+            const height = lines.length * 12 + 8;
+            group.select('.node-detail-bg')
+                .attr('width', width)
+                .attr('height', height)
+                .attr('stroke', d.mac === selectedNodeMac ? '#ffffff' : '#384466');
+        });
+
+        detailSelection.exit().remove();
     }
     
     function updateLabels() {
@@ -305,10 +385,15 @@ function initVisualization() {
             .on('tick', ticked);
         
         simulation.force('link')
+            .distance(d => getLinkDistance(d.rssi))
             .links(links);
         
         // Restart simulation
-        simulation.alpha(1).restart();
+        simulation.alphaTarget(0.08).restart();
+        window.clearTimeout(updateSimulation.alphaTimer);
+        updateSimulation.alphaTimer = window.setTimeout(() => {
+            simulation.alphaTarget(0);
+        }, 1400);
     }
     
     // Tick function for simulation
@@ -338,6 +423,11 @@ function initVisualization() {
                 .attr('x', d => d.x)
                 .attr('y', d => d.y);
         }
+
+        if (detailElements) {
+            detailElements
+                .attr('transform', d => `translate(${d.x + 18}, ${d.y - 36})`);
+        }
     }
     
     // Initial update
@@ -346,6 +436,7 @@ function initVisualization() {
     updateNodes();
     updateLabels();
     updateRssiLabels();
+    updateNodeDetails();
     
     // Return update functions
     return {
@@ -353,6 +444,7 @@ function initVisualization() {
         updateNodes,
         updateLabels,
         updateRssiLabels,
+        updateNodeDetails,
         updateSimulation,
         ticked
     };
@@ -384,9 +476,8 @@ function connectWebSocket() {
             switch (data.type) {
                 case 'full_state':
                     // Initial state
-                    nodes = {};
                     for (const node of data.data) {
-                        nodes[node.mac] = node;
+                        nodes[node.mac] = mergeNodeData(nodes[node.mac], node);
                     }
                     updateVisualization();
                     updateStats();
@@ -394,9 +485,26 @@ function connectWebSocket() {
                     
                 case 'node_update':
                     // Update single node
-                    nodes[data.data.mac] = data.data;
+                    nodes[data.data.mac] = mergeNodeData(nodes[data.data.mac], data.data);
                     updateVisualization();
+                    if (data.data.mac === selectedNodeMac) {
+                        nodeCommandStatus = '';
+                    }
                     updateStats();
+                    break;
+
+                case 'command_result':
+                    if (!data.data.ok) {
+                        console.warn('Command failed:', data.data.error);
+                        nodeCommandStatus = data.data.error || 'Command failed';
+                        configStatus = nodeCommandStatus;
+                        updateConfigStatus();
+                    } else if (data.data.target_mac === selectedNodeMac) {
+                        nodeCommandStatus = 'Toggle sent';
+                    } else if (data.data.command === 'config_update') {
+                        configStatus = 'Sent to MQTT';
+                        updateConfigStatus();
+                    }
                     break;
                     
                 case 'stats':
@@ -504,7 +612,99 @@ function updateVisualization() {
     visualization.updateNodes();
     visualization.updateLabels();
     visualization.updateRssiLabels();
+    visualization.updateNodeDetails();
 }
+
+function toggleNodeStatus(node) {
+    if (!node || !node.mac || node.discoveredFromTopology) return false;
+
+    selectedNodeMac = node.mac;
+    nodeCommandStatus = 'Sending toggle...';
+    updateVisualization();
+
+    if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({
+            type: 'toggle_node',
+            mac: node.mac
+        }));
+        return true;
+    }
+
+    fetch(`/api/nodes/${encodeURIComponent(node.mac)}/toggle`, { method: 'POST' })
+        .then(response => response.json())
+        .then(result => {
+            nodeCommandStatus = result.ok ? 'Toggle sent' : (result.error || 'Command failed');
+            updateVisualization();
+        })
+        .catch(error => {
+            nodeCommandStatus = 'Command failed';
+            console.error('Failed to toggle node:', error);
+            updateVisualization();
+        });
+
+    return true;
+}
+
+function startNodeHighlight(node) {
+    if (!node || !node.mac || node.discoveredFromTopology) return false;
+
+    if (highlightedNodeMac && highlightedNodeMac !== node.mac) {
+        const previousNode = nodes[highlightedNodeMac];
+        if (previousNode) {
+            previousNode.fx = null;
+            previousNode.fy = null;
+        }
+        sendNodeHighlight({ mac: highlightedNodeMac }, false);
+    }
+
+    if (Number.isFinite(node.x) && Number.isFinite(node.y)) {
+        node.fx = node.x;
+        node.fy = node.y;
+    }
+
+    return sendNodeHighlight(node, true);
+}
+
+function stopNodeHighlight(node) {
+    if (!node || !node.mac) return false;
+
+    node.fx = null;
+    node.fy = null;
+    return sendNodeHighlight(node, false);
+}
+
+function sendNodeHighlight(node, enabled) {
+    if (!node || !node.mac || node.discoveredFromTopology) return false;
+    if (enabled && highlightedNodeMac === node.mac) return true;
+    if (!enabled && highlightedNodeMac !== node.mac) return true;
+
+    highlightedNodeMac = enabled ? node.mac : null;
+
+    if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({
+            type: 'highlight_node',
+            mac: node.mac,
+            enabled
+        }));
+        return true;
+    }
+
+    fetch(`/api/nodes/${encodeURIComponent(node.mac)}/highlight`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ enabled })
+    }).catch(error => {
+        console.error('Failed to highlight node:', error);
+    });
+
+    return true;
+}
+
+window.addEventListener('beforeunload', () => {
+    if (highlightedNodeMac) {
+        sendNodeHighlight({ mac: highlightedNodeMac }, false);
+    }
+});
 
 /**
  * Update statistics display
@@ -525,105 +725,148 @@ function updateStats() {
     document.getElementById('last-update').textContent = now.toLocaleTimeString();
 }
 
-// ============================================================================
-// Node Information Panel
-// ============================================================================
-
-/**
- * Show node information panel
- */
-function showNodeInfo(node) {
-    const panel = document.getElementById('node-info-panel');
-    const content = document.getElementById('node-info-content');
-    
-    // Create HTML for node info
-    content.innerHTML = `
-        <div class="node-info-row">
-            <span class="node-info-label">MAC Address:</span>
-            <span class="node-info-value">${node.mac}</span>
-        </div>
-        <div class="node-info-row">
-            <span class="node-info-label">State:</span>
-            <span class="node-info-value">${getStateName(node.state)}</span>
-        </div>
-        <div class="node-info-row">
-            <span class="node-info-label">Temperature:</span>
-            <span class="node-info-value">${formatTemperature(node.temperature)}</span>
-        </div>
-        <div class="node-info-row">
-            <span class="node-info-label">mmWave Presence:</span>
-            <span class="node-info-value">${node.mmwavePresence ? 'Yes' : 'No'}</span>
-        </div>
-        <div class="node-info-row">
-            <span class="node-info-label">mmWave Distance:</span>
-            <span class="node-info-value">${formatDistance(node.mmwaveDistance)}</span>
-        </div>
-        <div class="node-info-row">
-            <span class="node-info-label">Neighbors:</span>
-            <span class="node-info-value">${node.neighbors.length}</span>
-        </div>
-        <div class="node-info-row">
-            <span class="node-info-label">Avg RSSI:</span>
-            <span class="node-info-value">${node.neighbors.length > 0 ? 
-                formatRssi(Math.round(node.neighbors.reduce((sum, n) => sum + n.rssi, 0) / node.neighbors.length)) : 'N/A'}</span>
-        </div>
-        <div class="node-info-row">
-            <span class="node-info-label">Last Update:</span>
-            <span class="node-info-value">${new Date(node.receivedAt).toLocaleTimeString()}</span>
-        </div>
-    `;
-    
-    // Add neighbor details
-    if (node.neighbors.length > 0) {
-        content.innerHTML += `<div class="node-info-row" style="margin-top: 10px;">
-            <span class="node-info-label">Neighbor Details:</span>
-        </div>`;
-        
-        for (const neighbor of node.neighbors) {
-            content.innerHTML += `
-                <div class="node-info-row" style="padding-left: 20px;">
-                    <span class="node-info-label">${shortenMac(neighbor.mac)}:</span>
-                    <span class="node-info-value">${formatRssi(neighbor.rssi)}</span>
-                </div>
-            `;
-        }
-    }
-    
-    panel.classList.add('active');
-}
-
-/**
- * Hide node information panel
- */
-function hideNodeInfo() {
-    document.getElementById('node-info-panel').classList.remove('active');
-}
-
 /**
  * Get state name from state code
  */
 function getStateName(state) {
     switch (state) {
-        case 0: return 'Idle';
-        case 1: return 'Active';
-        case 2: return 'Error';
-        case 3: return 'Booting';
+        case 0: return 'Booting';
+        case 1: return 'Idle';
+        case 2: return 'Active';
+        case 3: return 'Error';
         default: return 'Unknown';
     }
 }
 
 // ============================================================================
-// Event Handlers
+// Kernel / Activation Configuration
 // ============================================================================
 
-/**
- * Handle color scheme change
- */
-function onColorSchemeChange() {
-    const select = document.getElementById('color-scheme');
-    colorScheme = select.value;
-    updateVisualization();
+function initConfigEditor() {
+    const kernelGrid = document.getElementById('kernel-grid');
+    kernelGrid.innerHTML = '';
+
+    for (let i = 0; i < 9; i++) {
+        const field = document.createElement('label');
+        field.className = 'kernel-field';
+        field.innerHTML = `<span>k${i}</span><input id="kernel-${i}" type="number" step="0.1" value="0">`;
+        kernelGrid.appendChild(field);
+    }
+
+    setKernelValues([1, 1, 1, 1, 1, 1, 1, 1, 0]);
+    clearActivations();
+    addActivation(3, 4.5);
 }
+
+function getKernelValues() {
+    const values = [];
+    for (let i = 0; i < 9; i++) {
+        const value = Number(document.getElementById(`kernel-${i}`).value);
+        if (!Number.isFinite(value)) {
+            throw new Error(`Invalid k${i}`);
+        }
+        values.push(value);
+    }
+    return values;
+}
+
+function setKernelValues(values) {
+    values.forEach((value, i) => {
+        const input = document.getElementById(`kernel-${i}`);
+        if (input) input.value = value;
+    });
+}
+
+function addActivation(op = 2, value = 0) {
+    const list = document.getElementById('activation-list');
+    const row = document.createElement('div');
+    row.className = 'activation-row';
+    row.innerHTML = `
+        <select class="activation-op">
+            <option value="0">&lt;</option>
+            <option value="1">&lt;=</option>
+            <option value="2">==</option>
+            <option value="3">&gt;=</option>
+            <option value="4">&gt;</option>
+        </select>
+        <input class="activation-value" type="number" step="0.1" value="${value}">
+    `;
+    row.querySelector('.activation-op').value = String(op);
+    list.appendChild(row);
+}
+
+function clearActivations() {
+    document.getElementById('activation-list').innerHTML = '';
+}
+
+function getActivations() {
+    return Array.from(document.querySelectorAll('.activation-row')).map((row) => {
+        const op = Number(row.querySelector('.activation-op').value);
+        const value = Number(row.querySelector('.activation-value').value);
+        if (!Number.isFinite(op) || !Number.isFinite(value)) {
+            throw new Error('Invalid activation');
+        }
+        return { op, value };
+    });
+}
+
+function updateConfigStatus() {
+    const statusEl = document.getElementById('config-status');
+    if (statusEl) statusEl.textContent = configStatus;
+}
+
+function sendConfigCommand(payload) {
+    configStatus = 'Sending...';
+    updateConfigStatus();
+
+    if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({
+            type: 'config_update',
+            data: payload
+        }));
+        return;
+    }
+
+    fetch('/api/config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+    })
+        .then(response => response.json())
+        .then(result => {
+            configStatus = result.ok ? 'Sent to MQTT' : (result.error || 'Command failed');
+            updateConfigStatus();
+        })
+        .catch(error => {
+            configStatus = 'Command failed';
+            console.error('Failed to send config:', error);
+            updateConfigStatus();
+        });
+}
+
+function sendKernelActivationConfig() {
+    try {
+        sendConfigCommand({
+            kernel: getKernelValues(),
+            activations: getActivations()
+        });
+    } catch (error) {
+        configStatus = error.message;
+        updateConfigStatus();
+    }
+}
+
+function setActiveTab(tab) {
+    activeTab = tab;
+    document.body.classList.toggle('config-active', tab === 'configure');
+    document.getElementById('tab-topology').classList.toggle('active', tab === 'topology');
+    document.getElementById('tab-configure').classList.toggle('active', tab === 'configure');
+    onWindowResize();
+}
+
+// ============================================================================
+// Event Handlers
+// ============================================================================
 
 /**
  * Handle show labels toggle
@@ -655,6 +898,12 @@ function onMinRssiChange() {
  * Reset view
  */
 function resetView() {
+    if (svg && zoomBehavior) {
+        svg.transition()
+            .duration(250)
+            .call(zoomBehavior.transform, d3.zoomIdentity);
+    }
+
     if (simulation) {
         simulation
             .force('center', d3.forceCenter(window.innerWidth / 2, window.innerHeight / 2 - 100))
@@ -709,13 +958,27 @@ function init() {
     connectWebSocket();
     
     // Set up event listeners
-    document.getElementById('color-scheme').addEventListener('change', onColorSchemeChange);
+    document.getElementById('tab-topology').addEventListener('click', () => setActiveTab('topology'));
+    document.getElementById('tab-configure').addEventListener('click', () => setActiveTab('configure'));
     document.getElementById('show-labels').addEventListener('change', onShowLabelsChange);
     document.getElementById('show-rssi').addEventListener('change', onShowRssiChange);
     document.getElementById('min-rssi').addEventListener('input', onMinRssiChange);
     document.getElementById('reset-view').addEventListener('click', resetView);
     document.getElementById('pause-simulation').addEventListener('click', togglePause);
-    document.getElementById('close-node-info').addEventListener('click', hideNodeInfo);
+    document.getElementById('kernel-all-one').addEventListener('click', () => setKernelValues([1, 1, 1, 1, 1, 1, 1, 1, 1]));
+    document.getElementById('kernel-all-zero').addEventListener('click', () => setKernelValues([0, 0, 0, 0, 0, 0, 0, 0, 0]));
+    document.getElementById('kernel-neighbors').addEventListener('click', () => setKernelValues([1, 1, 1, 1, 1, 1, 1, 1, 0]));
+    document.getElementById('activation-add').addEventListener('click', () => addActivation());
+    document.getElementById('activation-remove').addEventListener('click', () => {
+        const rows = document.querySelectorAll('.activation-row');
+        if (rows.length > 0) rows[rows.length - 1].remove();
+    });
+    document.getElementById('activation-clear').addEventListener('click', () => {
+        clearActivations();
+        addActivation();
+    });
+    document.getElementById('config-send').addEventListener('click', sendKernelActivationConfig);
+    initConfigEditor();
     
     // Handle window resize
     window.addEventListener('resize', onWindowResize);

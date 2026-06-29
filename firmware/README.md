@@ -30,8 +30,11 @@ firmware/platformio/
 - The root publishes all node states to MQTT on `mesh/state`.
 - The root publishes bounded topology summaries on `mesh/topology`.
 - Nodes update state every `STATE_UPDATE_INTERVAL`, publish/send every `MQTT_UPDATE_INTERVAL_MS`, and publish/send immediately on meaningful state changes.
+- Passive beacon RSSI and ESP-NOW compact status keep bounded neighbor information moving even when no mesh route, router, or broker is available.
 - LED fade color is included in state JSON but does not trigger extra publishes by itself.
 - Nodes actively reconnect using explicit ESP-WiFi-Mesh self-organization plus a firmware health watchdog. They should recover automatically after temporary range, interference, power, router, or MQTT outages.
+- Router loss pauses MQTT on the root, but local neighbor behavior and mesh recovery continue. MQTT subscriptions resume when the root gets router/broker access again.
+- Targeted MQTT toggle commands are forwarded by the root through the mesh; global preset/kernel/activation commands are applied by the root and broadcast to current mesh routes.
 - Firmware recovers common NVS issues and restarts if Wi-Fi returns a zero MAC.
 
 ## Build
@@ -79,8 +82,10 @@ Important settings:
 | `MESH_HEALTH_CHECK_INTERVAL_MS` | Mesh watchdog interval |
 | `MESH_RECONNECT_ATTEMPT_MS` | Detached duration before explicit reconnect request |
 | `MESH_RECONNECT_RESTART_MS` | Detached duration before mesh restart |
-| `MESH_ROOT_IP_RECOVERY_MS` | Root IP recovery grace period |
 | `MESH_AP_ASSOC_EXPIRE_SECONDS` | Quiet child association timeout |
+| `ENABLE_BEACON_NEIGHBOR_DISCOVERY` | Passive beacon RSSI neighbor discovery |
+| `ENABLE_LOCAL_NEIGHBOR_STATUS` | ESP-NOW local status broadcast/receive |
+| `COMMAND_VALUE_HOLD_MS` | Hold after targeted toggle before activation resumes |
 | `MQTT_TOPOLOGY_ROUTE_SAMPLE_LIMIT` | Bounded routing sample size |
 
 `MAX_NEIGHBORS` is not the total mesh size. It is a local memory/sample bound used for activation inputs and compact topology output.

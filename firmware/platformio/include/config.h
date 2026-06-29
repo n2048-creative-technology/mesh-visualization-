@@ -146,9 +146,6 @@ typedef struct {
 #ifndef MESH_RECONNECT_RESTART_MS
 #define MESH_RECONNECT_RESTART_MS 60000
 #endif
-#ifndef MESH_ROOT_IP_RECOVERY_MS
-#define MESH_ROOT_IP_RECOVERY_MS 45000
-#endif
 #ifndef MESH_AP_ASSOC_EXPIRE_SECONDS
 #define MESH_AP_ASSOC_EXPIRE_SECONDS 30
 #endif
@@ -188,6 +185,12 @@ typedef struct {
 #ifndef RSSI_THRESHOLD
 #define RSSI_THRESHOLD -80
 #endif
+#ifndef ENABLE_BEACON_NEIGHBOR_DISCOVERY
+#define ENABLE_BEACON_NEIGHBOR_DISCOVERY 1
+#endif
+#ifndef ENABLE_LOCAL_NEIGHBOR_STATUS
+#define ENABLE_LOCAL_NEIGHBOR_STATUS 1
+#endif
 #ifndef ENABLE_WIFI_NEIGHBOR_SCAN
 #define ENABLE_WIFI_NEIGHBOR_SCAN 0
 #endif
@@ -206,6 +209,9 @@ typedef struct {
 
 #define STATE_UPDATE_INTERVAL 100
 #define TEMPERATURE_SCALE 10.0
+#ifndef COMMAND_VALUE_HOLD_MS
+#define COMMAND_VALUE_HOLD_MS 5000
+#endif
 
 // ============================================================================
 // LED Configuration
@@ -213,7 +219,7 @@ typedef struct {
 
 #define NUM_LEDS 1
 #define DATA_PIN 10
-#define TRANSITION_SPEED 0.002
+#define TRANSITION_SPEED 0.1
 #define LED_STRIP_RMT_RES_HZ 10000000
 #define TEMP_READ_INTERVAL_MS 5000
 
@@ -247,6 +253,11 @@ typedef struct {
 #define MSG_TYPE_STATE_UPDATE 0x01
 #define MSG_TYPE_BEACON 0x02
 #define MSG_TYPE_FORWARD 0x03
+#define MSG_TYPE_COMMAND 0x04
+
+#define MESH_COMMAND_TOGGLE_VALUE 0x01
+#define MESH_COMMAND_HIGHLIGHT_ON 0x02
+#define MESH_COMMAND_HIGHLIGHT_OFF 0x03
 
 // ============================================================================
 // Protocol Version
