@@ -58,6 +58,7 @@ let ws;
 let isPaused = false;
 let isConnected = false;
 let mqttConnected = false;
+let latestServerStats = null;
 let colorScheme = 'rssi';
 let showLabels = true;
 let showRssi = true;
@@ -400,6 +401,7 @@ function connectWebSocket() {
                     
                 case 'stats':
                     // Update stats
+                    latestServerStats = data.data;
                     updateStats();
                     break;
                     
@@ -509,9 +511,13 @@ function updateVisualization() {
  */
 function updateStats() {
     const nodeCount = Object.keys(nodes).length;
+    const meshReportedNodeCount = latestServerStats?.meshReportedNodeCount || 0;
     const connectionCount = links.length;
-    
-    document.getElementById('node-count').textContent = `${nodeCount} Nodes`;
+
+    document.getElementById('node-count').textContent =
+        meshReportedNodeCount > 0 && meshReportedNodeCount !== nodeCount
+            ? `${nodeCount} Nodes (${meshReportedNodeCount} mesh)`
+            : `${nodeCount} Nodes`;
     document.getElementById('connection-count').textContent = `${connectionCount} Connections`;
     
     // Update last update time

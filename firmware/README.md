@@ -1,210 +1,137 @@
-# ESP32 Mesh Node Firmware
+# Firmware
 
-This directory contains the firmware for ESP32 mesh nodes.
+The firmware is a PlatformIO ESP-IDF project for Seeed XIAO ESP32-C3 mesh nodes.
 
-## PlatformIO Project
+## Layout
 
-The firmware is organized as a **PlatformIO project** for easy development with **Visual Studio Code**.
-
-### Project Structure
-
-```
-firmware/
-├── README.md                   # This file
-└── platformio/
-    ├── platformio.ini          # PlatformIO configuration
-    ├── CMakeLists.txt           # CMake configuration (for IDE)
-    ├── README.md               # PlatformIO-specific documentation
-    ├── .vscode/
-    │   └── settings.json        # VS Code settings
-    ├── include/
-    │   ├── config.h            # Platform-aware configuration
-    │   ├── mesh_node.h
-    │   ├── beacon_monitor.h
-    │   └── state_manager.h
-    └── src/
-        ├── main.cpp
-        ├── mesh_node.cpp
-        ├── beacon_monitor.cpp
-        └── state_manager.cpp
+```text
+firmware/platformio/
+  platformio.ini
+  partitions.csv
+  include/
+    config.h
+    mesh_node.h
+    mqtt_handler.h
+    state_manager.h
+    beacon_monitor.h
+  src/
+    main.cpp
+    mesh_node.cpp
+    mqtt_handler.cpp
+    state_manager.cpp
+    beacon_monitor.cpp
 ```
 
-## Quick Start
+## Current Runtime Behavior
 
-### 1. Install Prerequisites
+- Nodes use ESP-WiFi-Mesh tree topology.
+- ESP-WiFi-Mesh elects a root dynamically.
+- Non-root nodes send state upward to the current root.
+- The root publishes all node states to MQTT on `mesh/state`.
+- The root publishes bounded topology summaries on `mesh/topology`.
+- Nodes update state every `STATE_UPDATE_INTERVAL`, publish/send every `MQTT_UPDATE_INTERVAL_MS`, and publish/send immediately on meaningful state changes.
+- LED fade color is included in state JSON but does not trigger extra publishes by itself.
+- Nodes actively reconnect using explicit ESP-WiFi-Mesh self-organization plus a firmware health watchdog. They should recover automatically after temporary range, interference, power, router, or MQTT outages.
+- Firmware recovers common NVS issues and restarts if Wi-Fi returns a zero MAC.
 
-- [VS Code](https://code.visualstudio.com/)
-- [PlatformIO Extension](https://platformio.org/install/ide?install=vscode)
+## Build
 
-### 2. Open Project
-
-1. Open VS Code
-2. Install PlatformIO extension
-3. Open the `firmware/platformio` folder
-4. PlatformIO will automatically install dependencies
-
-### 3. Select Target Platform
-
-Use the PlatformIO toolbar to select your target:
-
-- **ESP32-C3**: `esp32c3_devkitm_1` (2.4 GHz)
-- **ESP32-C5**: `esp32c5_devkitm_1` (5 GHz)
-- **Generic ESP32**: `esp32dev` (2.4 GHz)
-
-### 4. Build and Flash
-
-#### Using PlatformIO Toolbar:
-1. Click the PlatformIO icon in the sidebar
-2. Select your environment
-3. Click **Build** (✓ icon)
-4. Click **Upload** (→ icon)
-5. Click **Monitor** (🔌 icon) to see serial output
-
-#### Using Command Line:
 ```bash
-# Navigate to platformio directory
 cd firmware/platformio
-
-# Build for ESP32-C3 (2.4 GHz)
-pio run -e esp32c3_devkitm_1
-
-# Build for ESP32-C5 (5 GHz)
-pio run -e esp32c5_devkitm_1
-
-# Flash
-pio run -e esp32c3_devkitm_1 -t upload
-
-# Monitor
-pio device monitor -e esp32c3_devkitm_1
+PLATFORMIO_CORE_DIR=/tmp/pio-core PLATFORMIO_BUILD_DIR=/tmp/pio-build-mesh ~/.platformio/penv/bin/pio run
 ```
 
-## Platform Support
+## Upload
 
-| Platform | WiFi Band | Channel Range | Environment | Status |
-|----------|-----------|---------------|------------|--------|
-| ESP32-C3 | 2.4 GHz | 1-14 | `esp32c3_devkitm_1` | ✅ Supported |
-| ESP32-C5 | 5 GHz | 36-165 | `esp32c5_devkitm_1` | ✅ Supported |
-| ESP32 | 2.4 GHz | 1-14 | `esp32dev` | ✅ Supported |
+Upload one node:
+
+```bash
+PLATFORMIO_CORE_DIR=/tmp/pio-core PLATFORMIO_BUILD_DIR=/tmp/pio-build-mesh ~/.platformio/penv/bin/pio run --target upload --upload-port /dev/ttyACM0
+```
+
+Upload all attached USB serial/JTAG boards:
+
+```bash
+./upload.sh
+```
+
+Monitor one node:
+
+```bash
+~/.platformio/penv/bin/pio device monitor -p /dev/ttyACM0 -b 115200
+```
 
 ## Configuration
 
-### WiFi Channel Configuration
+Primary configuration lives in `platformio/include/config.h`.
 
-The WiFi channel is automatically set based on the platform:
+Important settings:
 
-- **ESP32-C3**: Channel 6 (2.4 GHz)
-- **ESP32-C5**: Channel 36 (5 GHz)
-- **Generic ESP32**: Channel 6 (2.4 GHz)
+| Setting | Meaning |
+| --- | --- |
+| `NETWORK_ENV_HOME` | Enables the home network defaults from `config.h` |
+| `MESH_ROUTER_SSID`, `MESH_ROUTER_PASS` | Router credentials used by ESP-WiFi-Mesh |
+| `MQTT_BROKER_IP`, `MQTT_BROKER_PORT` | Broker used by the elected root |
+| `MESH_MAX_HOPS` | Maximum mesh depth |
+| `MESH_AP_CONNECTIONS` | Maximum mesh children per node AP |
+| `MAX_NEIGHBORS` | Bounded local neighbor table |
+| `MQTT_UPDATE_INTERVAL_MS` | State heartbeat interval |
+| `MESH_HEALTH_CHECK_INTERVAL_MS` | Mesh watchdog interval |
+| `MESH_RECONNECT_ATTEMPT_MS` | Detached duration before explicit reconnect request |
+| `MESH_RECONNECT_RESTART_MS` | Detached duration before mesh restart |
+| `MESH_ROOT_IP_RECOVERY_MS` | Root IP recovery grace period |
+| `MESH_AP_ASSOC_EXPIRE_SECONDS` | Quiet child association timeout |
+| `MQTT_TOPOLOGY_ROUTE_SAMPLE_LIMIT` | Bounded routing sample size |
 
-You can override this in `platformio.ini`:
+`MAX_NEIGHBORS` is not the total mesh size. It is a local memory/sample bound used for activation inputs and compact topology output.
 
-```ini
-[env:esp32c3_devkitm_1]
-build_flags =
-    -DWIFI_CHANNEL=11  ; Use channel 11 instead of 6
-```
+## State and Activation
 
-### Visualization Server IP
+The node state includes:
 
-Set the visualization server IP in `platformio.ini`:
+- state code
+- RGB color
+- temperature x10
+- mmWave presence/distance
+- binary `value`
+- activation sum
+- kernel values
+- activation rules
+- sequence numbers for kernel/value/activation propagation
 
-```ini
-[env:esp32c3_devkitm_1]
-build_flags =
-    -DVISUALIZATION_IP="192.168.1.100"
-```
-
-### Debug Logging
-
-Enable debug logging in `platformio.ini`:
-
-```ini
-[env:esp32c3_devkitm_1]
-build_flags =
-    -DDEBUG_MESH=true
-    -DDEBUG_BEACON=true
-    -DDEBUG_UDP=true
-    -DDEBUG_NEIGHBORS=true
-    -DDEBUG_TX_POWER=true
-```
-
-## Features
-
-### Core Functionality
-- ✅ **ESP-WiFi-Mesh**: Decentralized mesh networking
-- ✅ **Dynamic Neighbor Management**: Top 8 closest neighbors by RSSI
-- ✅ **UDP Unicast**: Efficient state updates to neighbors only
-- ✅ **Mesh Forwarding**: Non-neighbor packets forwarded through mesh
-- ✅ **Dynamic TX Power**: Adjusts based on weakest neighbor RSSI
-- ✅ **Self-Healing**: Automatic reconnection when nodes fail
-
-### Sensor Support
-- ✅ **Temperature Sensor**: ADC-based temperature reading
-- ✅ **mmWave Radar**: Presence detection and distance measurement
-- ✅ **RGB LED**: Visual state indication
-
-### Protocol
-- ✅ **Binary Protocol**: Efficient 77-byte messages
-- ✅ **Checksum**: Message integrity verification
-- ✅ **Platform-Aware**: Automatic configuration for ESP32-C3/C5
-
-## Pin Configuration
-
-Default pin assignments (can be changed in `include/config.h`):
-
-| Function | Pin | Description |
-|----------|-----|-------------|
-| LED_RED | GPIO 1 | Red LED |
-| LED_GREEN | GPIO 2 | Green LED |
-| LED_BLUE | GPIO 3 | Blue LED |
-| TEMPERATURE | GPIO 4 | Temperature sensor |
-| MMWAVE_PRESENCE | GPIO 5 | mmWave presence detection |
-
-## Documentation
-
-- [PlatformIO Setup](platformio/README.md) - Detailed PlatformIO configuration
-- [API Documentation](../../docs/api.md) - Message formats and protocols
-- [Architecture](../../docs/architecture.md) - System architecture
+The activation/kernel behavior is inspired by `n2048-creative-technology/emergent-esp32`.
 
 ## Troubleshooting
 
-### Build Errors
+### Node appears on USB but not in MQTT
 
-1. **Missing PlatformIO**: Install PlatformIO extension in VS Code
-2. **Missing ESP-IDF**: PlatformIO will install it automatically
-3. **Python version**: Use Python 3.7+
+1. Identify the MAC:
 
-### Flashing Errors
+   ```bash
+   for p in /dev/ttyACM* /dev/ttyUSB*; do
+     ~/.platformio/packages/tool-esptoolpy/esptool.py --chip auto --port "$p" chip_id || true
+   done
+   ```
 
-1. **Device not found**: Check USB connection
-2. **Permission denied**: Add user to dialout group (Linux)
-3. **Wrong board**: Select correct environment in PlatformIO
+2. Monitor boot:
 
-### Runtime Errors
+   ```bash
+   ~/.platformio/penv/bin/pio device monitor -p <port> -b 115200
+   ```
 
-1. **WiFi not connecting**: Check channel and credentials
-2. **Mesh not forming**: Ensure all nodes have same configuration
-3. **No UDP messages**: Check firewall and IP configuration
+3. If logs show a zero MAC or NVS/Wi-Fi errors, erase flash once and upload again:
 
-## VS Code Tips
+   ```bash
+   ~/.platformio/packages/tool-esptoolpy/esptool.py --chip esp32c3 --port <port> erase_flash
+   PLATFORMIO_CORE_DIR=/tmp/pio-core PLATFORMIO_BUILD_DIR=/tmp/pio-build-mesh ~/.platformio/penv/bin/pio run --target upload --upload-port <port>
+   ```
 
-### Recommended Extensions
-- PlatformIO
-- C/C++ (Microsoft)
-- CMake Tools
-- Clang-Format
-- GitLens
+### Mesh shows fewer nodes after reboot/upload
 
-### Keybindings
-- `Ctrl+Shift+P`: Command palette
-- `Ctrl+Shift+B`: Build
-- `Ctrl+Alt+U`: Upload
-- `Ctrl+Shift+M`: Monitor
+ESP-WiFi-Mesh needs time to elect a root and reparent children. Nodes publish immediately when they attach/reparent and then resume the 5-second heartbeat. Check MQTT:
 
-## License
+```bash
+mosquitto_sub -h 192.168.178.169 -t 'mesh/#' -v
+```
 
-MIT License - see the main [LICENSE](../../LICENSE) file for details.
-
----
-
-**For detailed PlatformIO configuration, see [platformio/README.md](platformio/README.md)**
+Look at `mesh/topology.routing_table_size` for the root's current mesh count.

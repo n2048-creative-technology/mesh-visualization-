@@ -289,7 +289,9 @@ static void format_kernel_json(const node_state_t *state, char *kernel, size_t k
         offset += snprintf(kernel + offset, kernel_len - offset, "%s%.4f",
                            i == 0 ? "" : ",", state->kernel[i]);
     }
-    snprintf(kernel + offset, kernel_len - offset, "]");
+    if (offset < kernel_len) {
+        snprintf(kernel + offset, kernel_len - offset, "]");
+    }
 }
 
 static void format_activations_json(const node_state_t *state, char *activations, size_t activations_len) {
@@ -302,7 +304,9 @@ static void format_activations_json(const node_state_t *state, char *activations
                            state->activations[i].op,
                            state->activations[i].value);
     }
-    snprintf(activations + offset, activations_len - offset, "]");
+    if (offset < activations_len) {
+        snprintf(activations + offset, activations_len - offset, "]");
+    }
 }
 
 void mqtt_publish_node_state(const uint8_t *node_mac_value, const node_state_t *state) {
@@ -314,14 +318,22 @@ void mqtt_publish_node_state(const uint8_t *node_mac_value, const node_state_t *
     }
 
     char mac[18];
-    char kernel[192];
-    char activations[256];
-    char payload[1024];
-    snprintf(mac, sizeof(mac), MACSTR, MAC2STR(node_mac_value));
-    format_kernel_json(state, kernel, sizeof(kernel));
-    format_activations_json(state, activations, sizeof(activations));
+    char *kernel = (char *)calloc(192, 1);
+    char *activations = (char *)calloc(256, 1);
+    char *payload = (char *)calloc(1024, 1);
+    if (kernel == NULL || activations == NULL || payload == NULL) {
+        ESP_LOGW(TAG, "Skipping MQTT state publish: allocation failed");
+        free(kernel);
+        free(activations);
+        free(payload);
+        return;
+    }
 
-    snprintf(payload, sizeof(payload),
+    snprintf(mac, sizeof(mac), MACSTR, MAC2STR(node_mac_value));
+    format_kernel_json(state, kernel, 192);
+    format_activations_json(state, activations, 256);
+
+    snprintf(payload, 1024,
              "{\"mac\":\"%s\",\"state\":%u,\"temperature\":%d,"
              "\"mmwave_presence\":%u,\"mmwave_distance\":%lu,\"timestamp\":%lu,"
              "\"value\":%u,\"activation_sum\":%.4f,"
@@ -342,6 +354,9 @@ void mqtt_publish_node_state(const uint8_t *node_mac_value, const node_state_t *
              state->color[0], state->color[1], state->color[2]);
 
     esp_mqtt_client_publish(mqtt_client, MQTT_STATE_TOPIC, payload, 0, 0, 0);
+    free(kernel);
+    free(activations);
+    free(payload);
 }
 
 void mqtt_publish_state(void) {
@@ -361,23 +376,31 @@ void mqtt_publish_topology(void) {
     }
 
     char mac[18];
-    char neighbors[512];
-    char routing[640];
-    char payload[2400];
+    char *neighbors = (char *)calloc(512, 1);
+    char *routing = (char *)calloc(640, 1);
+    char *payload = (char *)calloc(2400, 1);
+    if (neighbors == NULL || routing == NULL || payload == NULL) {
+        ESP_LOGW(TAG, "Skipping MQTT topology publish: allocation failed");
+        free(neighbors);
+        free(routing);
+        free(payload);
+        return;
+    }
+
     snprintf(mac, sizeof(mac), MACSTR, MAC2STR(node_mac));
 
     size_t offset = 0;
-    offset += snprintf(neighbors + offset, sizeof(neighbors) - offset, "[");
+    offset += snprintf(neighbors + offset, 512 - offset, "[");
     bool first = true;
     int neighbor_sample_count = 0;
     for (int i = 0; i < MAX_NEIGHBORS &&
                     neighbor_sample_count < MQTT_TOPOLOGY_NEIGHBOR_SAMPLE_LIMIT &&
-                    offset < sizeof(neighbors); i++) {
+                    offset < 512; i++) {
         if (!neighbor_list[i].active) continue;
 
         char neighbor_mac[18];
         snprintf(neighbor_mac, sizeof(neighbor_mac), MACSTR, MAC2STR(neighbor_list[i].mac));
-        offset += snprintf(neighbors + offset, sizeof(neighbors) - offset,
+        offset += snprintf(neighbors + offset, 512 - offset,
                            "%s{\"mac\":\"%s\",\"rssi\":%d,\"last_seen\":%lu,\"value\":%u}",
                            first ? "" : ",", neighbor_mac, neighbor_list[i].rssi,
                            (unsigned long)neighbor_list[i].last_seen,
@@ -385,7 +408,9 @@ void mqtt_publish_topology(void) {
         first = false;
         neighbor_sample_count++;
     }
-    snprintf(neighbors + offset, sizeof(neighbors) - offset, "]");
+    if (offset < 512) {
+        snprintf(neighbors + offset, 512 - offset, "]");
+    }
 
     int layer = mesh_initialized ? esp_mesh_get_layer() : 0;
     int rtable_size = mesh_initialized ? esp_mesh_get_routing_table_size() : 0;
@@ -404,16 +429,18 @@ void mqtt_publish_topology(void) {
     }
 
     offset = 0;
-    offset += snprintf(routing + offset, sizeof(routing) - offset, "[");
-    for (int i = 0; i < route_count && offset < sizeof(routing); i++) {
+    offset += snprintf(routing + offset, 640 - offset, "[");
+    for (int i = 0; i < route_count && offset < 640; i++) {
         char route_mac[18];
         snprintf(route_mac, sizeof(route_mac), MACSTR, MAC2STR(route_table[i].addr));
-        offset += snprintf(routing + offset, sizeof(routing) - offset,
+        offset += snprintf(routing + offset, 640 - offset,
                            "%s\"%s\"", i == 0 ? "" : ",", route_mac);
     }
-    snprintf(routing + offset, sizeof(routing) - offset, "]");
+    if (offset < 640) {
+        snprintf(routing + offset, 640 - offset, "]");
+    }
 
-    snprintf(payload, sizeof(payload),
+    snprintf(payload, 2400,
              "{\"node_mac\":\"%s\",\"node_state\":%u,\"value\":%u,"
              "\"layer\":%d,\"target_node_count\":%d,"
              "\"routing_table_size\":%d,\"route_sample_count\":%d,"
@@ -428,4 +455,7 @@ void mqtt_publish_topology(void) {
              neighbors, routing, routing);
 
     esp_mqtt_client_publish(mqtt_client, MQTT_TOPOLOGY_TOPIC, payload, 0, 0, 0);
+    free(neighbors);
+    free(routing);
+    free(payload);
 }

@@ -32,6 +32,9 @@ static const char *TAG = "MAIN";
 static esp_netif_t *mesh_netif_sta = NULL;
 static uint32_t last_mesh_attached_ms = 0;
 static uint32_t last_mesh_health_check_ms = 0;
+static uint32_t last_mesh_reconnect_attempt_ms = 0;
+static uint32_t last_root_ip_ok_ms = 0;
+static bool mesh_status_publish_requested = false;
 
 // Global MAC address
 uint8_t node_mac[6] = {0};
@@ -47,6 +50,7 @@ static bool state_publish_relevant_change(const node_state_t *previous, const no
 static void init_nvs_storage(void);
 static bool mac_is_zero(const uint8_t *mac);
 static void check_mesh_health(uint32_t now);
+static void request_mesh_status_publish(void);
 
 /**
  * IP event handler
@@ -57,6 +61,8 @@ void ip_event_handler(void *arg, esp_event_base_t event_base,
     if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *event = (ip_event_got_ip_t *) event_data;
         ESP_LOGI(TAG, "<IP_EVENT_STA_GOT_IP>IP:" IPSTR, IP2STR(&event->ip_info.ip));
+        last_root_ip_ok_ms = esp_timer_get_time() / 1000;
+        request_mesh_status_publish();
         
         // Now that we have IP, start UDP and TCP services
         init_udp();
@@ -76,30 +82,36 @@ void mesh_event_handler(void *arg, esp_event_base_t event_base,
     switch (event_id) {
         case MESH_EVENT_STARTED: {
             ESP_LOGI(TAG, "<MESH_EVENT_STARTED>");
+            request_mesh_status_publish();
             break;
         }
         case MESH_EVENT_STOPPED: {
             ESP_LOGI(TAG, "<MESH_EVENT_STOPPED>");
             mesh_initialized = false;
             has_current_root_addr = false;
+            request_mesh_status_publish();
             break;
         }
         case MESH_EVENT_CHILD_CONNECTED: {
             mesh_event_child_connected_t *child_connected = (mesh_event_child_connected_t *)event_data;
             ESP_LOGI(TAG, "<MESH_EVENT_CHILD_CONNECTED>aid:%d, " MACSTR "", 
                      child_connected->aid, MAC2STR(child_connected->mac));
+            request_mesh_status_publish();
             break;
         }
         case MESH_EVENT_CHILD_DISCONNECTED: {
             mesh_event_child_disconnected_t *child_disconnected = (mesh_event_child_disconnected_t *)event_data;
             ESP_LOGI(TAG, "<MESH_EVENT_CHILD_DISCONNECTED>aid:%d, " MACSTR "", 
                      child_disconnected->aid, MAC2STR(child_disconnected->mac));
+            request_mesh_status_publish();
             break;
         }
         case MESH_EVENT_PARENT_CONNECTED: {
             mesh_event_connected_t *connected = (mesh_event_connected_t *)event_data;
             ESP_LOGI(TAG, "<MESH_EVENT_PARENT_CONNECTED>layer:%d", connected->self_layer);
             last_mesh_attached_ms = esp_timer_get_time() / 1000;
+            last_mesh_reconnect_attempt_ms = 0;
+            request_mesh_status_publish();
             if (esp_mesh_is_root()) {
                 memcpy(current_root_addr.addr, node_mac, sizeof(current_root_addr.addr));
                 has_current_root_addr = true;
@@ -109,6 +121,9 @@ void mesh_event_handler(void *arg, esp_event_base_t event_base,
                     if (err != ESP_OK && err != ESP_ERR_ESP_NETIF_DHCP_ALREADY_STARTED) {
                         ESP_LOGW(TAG, "Failed to start root DHCP client: %s", esp_err_to_name(err));
                     }
+                }
+                if (has_ip_address()) {
+                    last_root_ip_ok_ms = esp_timer_get_time() / 1000;
                 }
                 init_udp();
                 start_tcp_server();
@@ -128,12 +143,14 @@ void mesh_event_handler(void *arg, esp_event_base_t event_base,
             }
             has_current_root_addr = true;
             ESP_LOGI(TAG, "<MESH_EVENT_ROOT_ADDRESS>" MACSTR, MAC2STR(current_root_addr.addr));
+            request_mesh_status_publish();
             break;
         }
         case MESH_EVENT_PARENT_DISCONNECTED: {
             mesh_event_disconnected_t *disconnected = (mesh_event_disconnected_t *)event_data;
             ESP_LOGI(TAG, "<MESH_EVENT_PARENT_DISCONNECTED>reason:%d", disconnected->reason);
             has_current_root_addr = false;
+            request_mesh_status_publish();
             break;
         }
         case MESH_EVENT_LAYER_CHANGE: {
@@ -141,12 +158,20 @@ void mesh_event_handler(void *arg, esp_event_base_t event_base,
             ESP_LOGI(TAG, "<MESH_EVENT_LAYER_CHANGE>new_layer:%d", layer_change->new_layer);
             if (layer_change->new_layer > 0) {
                 last_mesh_attached_ms = esp_timer_get_time() / 1000;
+                last_mesh_reconnect_attempt_ms = 0;
             }
+            request_mesh_status_publish();
             break;
         }
         case MESH_EVENT_NO_PARENT_FOUND: {
             mesh_event_no_parent_found_t *no_parent = (mesh_event_no_parent_found_t *)event_data;
             ESP_LOGI(TAG, "<MESH_EVENT_NO_PARENT_FOUND>scan times:%d", no_parent->scan_times);
+            request_mesh_status_publish();
+            break;
+        }
+        case MESH_EVENT_ROUTING_TABLE_ADD:
+        case MESH_EVENT_ROUTING_TABLE_REMOVE: {
+            request_mesh_status_publish();
             break;
         }
         case MESH_EVENT_TODS_STATE: {
@@ -400,6 +425,10 @@ static bool mac_is_zero(const uint8_t *mac) {
     return mac == NULL || memcmp(mac, zero_mac, sizeof(zero_mac)) == 0;
 }
 
+static void request_mesh_status_publish(void) {
+    mesh_status_publish_requested = true;
+}
+
 static void check_mesh_health(uint32_t now) {
     if (now - last_mesh_health_check_ms < MESH_HEALTH_CHECK_INTERVAL_MS) {
         return;
@@ -415,12 +444,62 @@ static void check_mesh_health(uint32_t now) {
     int layer = esp_mesh_get_layer();
     if (layer > 0) {
         last_mesh_attached_ms = now;
+
+        if (esp_mesh_is_root()) {
+            if (has_ip_address()) {
+                last_root_ip_ok_ms = now;
+#if ENABLE_MQTT_VISUALIZATION
+                if (mqtt_client == NULL) {
+                    init_mqtt();
+                }
+#endif
+            } else {
+                if (last_root_ip_ok_ms == 0) {
+                    last_root_ip_ok_ms = now;
+                }
+
+                if (mesh_netif_sta != NULL) {
+                    esp_err_t err = esp_netif_dhcpc_start(mesh_netif_sta);
+                    if (err != ESP_OK && err != ESP_ERR_ESP_NETIF_DHCP_ALREADY_STARTED) {
+                        ESP_LOGW(TAG, "Root DHCP recovery start failed: %s", esp_err_to_name(err));
+                    }
+                }
+
+                if (now - last_root_ip_ok_ms >= MESH_ROOT_IP_RECOVERY_MS) {
+                    ESP_LOGW(TAG, "Root has had no router IP for %lu ms; requesting mesh reconnect",
+                             (unsigned long)(now - last_root_ip_ok_ms));
+                    has_current_root_addr = false;
+                    esp_err_t err = esp_mesh_disconnect();
+                    if (err != ESP_OK) {
+                        ESP_LOGW(TAG, "Root mesh disconnect request failed: %s", esp_err_to_name(err));
+                    }
+                    err = esp_mesh_connect();
+                    if (err != ESP_OK) {
+                        ESP_LOGW(TAG, "Root mesh reconnect request failed: %s", esp_err_to_name(err));
+                    }
+                    last_root_ip_ok_ms = now;
+                }
+            }
+        }
+
         return;
     }
 
     if (last_mesh_attached_ms == 0) {
         last_mesh_attached_ms = now;
         return;
+    }
+
+    if (now - last_mesh_attached_ms >= MESH_RECONNECT_ATTEMPT_MS &&
+        now - last_mesh_reconnect_attempt_ms >= MESH_RECONNECT_ATTEMPT_MS) {
+        ESP_LOGW(TAG, "Mesh has been detached for %lu ms; requesting reconnect",
+                 (unsigned long)(now - last_mesh_attached_ms));
+        has_current_root_addr = false;
+        esp_err_t err = esp_mesh_connect();
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "Mesh reconnect request failed: %s", esp_err_to_name(err));
+        }
+        last_mesh_reconnect_attempt_ms = now;
     }
 
     if (now - last_mesh_attached_ms >= MESH_RECONNECT_RESTART_MS) {
@@ -435,6 +514,8 @@ static void check_mesh_health(uint32_t now) {
         vTaskDelay(pdMS_TO_TICKS(500));
         init_mesh();
         last_mesh_attached_ms = now;
+        last_mesh_reconnect_attempt_ms = now;
+        request_mesh_status_publish();
     }
 }
 
@@ -529,10 +610,12 @@ extern "C" void app_main(void)
             bool state_changed = !has_published_state ||
                                  state_publish_relevant_change(&last_published_state, &node_state);
             bool periodic_due = now - last_mesh_state_publish >= MQTT_UPDATE_INTERVAL_MS;
-            if (state_changed || periodic_due) {
+            bool publish_requested = mesh_status_publish_requested;
+            if (state_changed || periodic_due || publish_requested) {
                 last_mesh_state_publish = now;
                 last_published_state = node_state;
                 has_published_state = true;
+                mesh_status_publish_requested = false;
                 send_state_to_neighbors();
 #if ENABLE_MQTT_VISUALIZATION
                 if (esp_mesh_is_root() && is_mqtt_connected()) {

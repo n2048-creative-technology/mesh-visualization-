@@ -48,6 +48,13 @@ let mqttConnected = false;
 // Node state storage
 const nodes = {};
 const STALE_NODE_TIMEOUT_MS = Number(process.env.STALE_NODE_TIMEOUT_MS || 30000);
+let latestTopology = {
+    rootMac: null,
+    routingTableSize: 0,
+    routeSampleCount: 0,
+    routingTableTruncated: false,
+    updatedAt: null
+};
 
 // Message statistics
 let messageCount = 0;
@@ -459,6 +466,13 @@ function handleMqttMessage(topic, payload) {
 
     const additionalUpdates = [];
     if (topic === MQTT_TOPOLOGY_TOPIC) {
+        latestTopology = {
+            rootMac: payload.node_mac || node.mac,
+            routingTableSize: Number(payload.routing_table_size || 0),
+            routeSampleCount: Number(payload.route_sample_count || 0),
+            routingTableTruncated: Boolean(payload.routing_table_truncated),
+            updatedAt: Date.now()
+        };
         additionalUpdates.push(...ensureTopologyReferences(payload, node.mac));
         if (additionalUpdates.length > 0) {
             console.log(`MQTT: Topology referenced ${additionalUpdates.length} additional node(s)`);
@@ -535,6 +549,8 @@ app.get('/api/topology', (req, res) => {
 app.get('/api/stats', (req, res) => {
     res.json({
         nodeCount: Object.keys(nodes).length,
+        meshReportedNodeCount: latestTopology.routingTableSize,
+        latestTopology,
         messageCount,
         lastMessageTime,
         uptime: process.uptime()
@@ -664,6 +680,8 @@ setInterval(() => {
                 type: 'stats', 
                 data: {
                     nodeCount: Object.keys(nodes).length,
+                    meshReportedNodeCount: latestTopology.routingTableSize,
+                    latestTopology,
                     messageCount,
                     lastMessageTime
                 } 

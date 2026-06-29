@@ -102,6 +102,9 @@ void init_mesh(void) {
     ESP_ERROR_CHECK(esp_mesh_set_max_layer(MESH_MAX_HOPS));
     ESP_ERROR_CHECK(esp_mesh_set_vote_percentage(MESH_VOTE_PERCENT));
     ESP_ERROR_CHECK(esp_mesh_disable_ps());
+    ESP_ERROR_CHECK(esp_mesh_fix_root(false));
+    ESP_ERROR_CHECK(esp_mesh_set_self_organized(true, false));
+    ESP_ERROR_CHECK(esp_mesh_set_ap_assoc_expire(MESH_AP_ASSOC_EXPIRE_SECONDS));
     
     mesh_cfg_t cfg = {};
     cfg.crypto_funcs = &g_wifi_default_mesh_crypto_funcs;
@@ -769,7 +772,7 @@ void mac_to_ip(uint8_t *mac, uint8_t *ip) {
     // Then use last two bytes of MAC as last two bytes of IP
     
     // Parse IP_PREFIX (e.g., "10.65." or "192.168.")
-    // For now, use a simple hardcoded approach based on NETWORK_ENV_HOME
+    // Select the configured deployment prefix.
     #ifndef NETWORK_ENV_HOME
     // Studio environment (10.65.x.x)
     ip[0] = 10;

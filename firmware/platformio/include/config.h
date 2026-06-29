@@ -140,8 +140,17 @@ typedef struct {
 #ifndef MESH_HEALTH_CHECK_INTERVAL_MS
 #define MESH_HEALTH_CHECK_INTERVAL_MS 10000
 #endif
+#ifndef MESH_RECONNECT_ATTEMPT_MS
+#define MESH_RECONNECT_ATTEMPT_MS 15000
+#endif
 #ifndef MESH_RECONNECT_RESTART_MS
 #define MESH_RECONNECT_RESTART_MS 60000
+#endif
+#ifndef MESH_ROOT_IP_RECOVERY_MS
+#define MESH_ROOT_IP_RECOVERY_MS 45000
+#endif
+#ifndef MESH_AP_ASSOC_EXPIRE_SECONDS
+#define MESH_AP_ASSOC_EXPIRE_SECONDS 30
 #endif
 
 // ============================================================================
